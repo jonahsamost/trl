@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import json
 import base64
 import logging
 import os
@@ -209,6 +210,10 @@ class ScriptArguments:
         log_level (`str`, *optional*, defaults to `"info"`):
             Log level for uvicorn. Possible choices: `"critical"`, `"error"`, `"warning"`, `"info"`, `"debug"`,
             `"trace"`.
+        extra_llm_kwargs (`str`, *optional*, defaults to `"{}"`):
+            JSON string of additional keyword arguments passed directly to ``vllm.LLM()``. Useful for vLLM engine
+            options not explicitly exposed as CLI arguments, such as `language_model_only`, `gdn_prefill_backend`,
+            or `generation_config`. Keys that conflict with other arguments will override them.
     """
 
     model: str = field(
@@ -305,6 +310,14 @@ class ScriptArguments:
             "model implementation."
         },
     )
+    extra_llm_kwargs: str = field(
+        default="{}",
+        metadata={
+            "help": "JSON string of additional keyword arguments to pass directly to `vllm.LLM()`. "
+            "Useful for vLLM options not explicitly exposed by this script. "
+            "Keys that conflict with other arguments will overide them."
+        },
+    )
 
 
 def llm_worker(
@@ -317,6 +330,14 @@ def llm_worker(
     os.environ["VLLM_DP_RANK_LOCAL"] = str(data_parallel_rank)
     os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
     os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
+
+    try:
+        extra_kwargs = json.loads(script_args.extra_llm_kwargs)
+    except json.JSONDecodeError as e:
+        logging.getLogger(__name__).error(
+            f'Failed to parse extra_llm_kwargs as JSON: {e}. Ignoring extra kwargs'
+        )
+        extra_kwargs = {}
 
     llm = LLM(
         model=script_args.model,
@@ -336,6 +357,7 @@ def llm_worker(
         model_impl=script_args.vllm_model_impl,
         # Important so temperature scaling/logit tweaking affects the TIS log probs
         logprobs_mode="processed_logprobs",
+        **extra_kwargs,
     )
 
     # Send ready signal to parent process
