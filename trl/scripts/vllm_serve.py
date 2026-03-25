@@ -339,7 +339,13 @@ def llm_worker(
         )
         extra_kwargs = {}
 
-    llm = LLM(
+    if not isinstance(extra_kwargs, dict):
+        logging.getLogger(__name__).error(
+            f'extra_llm_kwargs must be a JSON object, got {type(extra_kwargs).__name__}. Ignoring extra kwargs'
+        )
+        extra_kwargs = {}
+
+    llm_kwargs = dict(
         model=script_args.model,
         revision=script_args.revision,
         tensor_parallel_size=script_args.tensor_parallel_size,
@@ -357,8 +363,9 @@ def llm_worker(
         model_impl=script_args.vllm_model_impl,
         # Important so temperature scaling/logit tweaking affects the TIS log probs
         logprobs_mode="processed_logprobs",
-        **extra_kwargs,
     )
+    llm_kwargs.update(extra_kwargs)
+    llm = LLM(**llm_kwargs)
 
     # Send ready signal to parent process
     connection.send({"status": "ready"})
