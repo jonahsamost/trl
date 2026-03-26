@@ -331,19 +331,7 @@ def llm_worker(
     os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
     os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
 
-    try:
-        extra_kwargs = json.loads(script_args.extra_llm_kwargs)
-    except json.JSONDecodeError as e:
-        logging.getLogger(__name__).error(
-            f'Failed to parse extra_llm_kwargs as JSON: {e}. Ignoring extra kwargs'
-        )
-        extra_kwargs = {}
-
-    if not isinstance(extra_kwargs, dict):
-        logging.getLogger(__name__).error(
-            f'extra_llm_kwargs must be a JSON object, got {type(extra_kwargs).__name__}. Ignoring extra kwargs'
-        )
-        extra_kwargs = {}
+    extra_kwargs = json.loads(script_args.extra_llm_kwargs)
 
     llm_kwargs = dict(
         model=script_args.model,
