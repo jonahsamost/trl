@@ -292,6 +292,19 @@ class AsyncGRPOTrainer(_BaseTrainer):
         model_name = model
         model = AutoModelForCausalLM.from_pretrained(model, device_map=None, dtype=torch.float32)
 
+        if self.args.use_lora:
+            lora_count = 0
+            for name, param in model.named_parameters():
+                param.requires_grad = "lora_" in name
+                if param.requires_grad:
+                    lora_count += 1
+            if lora_count == 0:
+                raise ValueError(
+                    "use_lora=True but no LoRA parameters found in model. "
+                    "Ensure the model path contains adapter_config.json and adapter weights."
+                )
+            logger.info(f"Enabled gradients on {lora_count} LoRA parameter tensors")
+
         if self.args.use_liger_kernel:
             raise NotImplementedError("`use_liger_kernel` is not supported yet.")
 
