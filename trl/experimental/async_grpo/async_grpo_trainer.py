@@ -61,6 +61,7 @@ class RolloutWorkerProtocol(Protocol):
     def pause(self) -> None: ...
     def resume(self) -> None: ...
     def send_weights(self, iterator: Iterator[tuple[str, torch.Tensor]]) -> None: ...
+    def reload_lora(self, adapter_path: str, lora_name: str) -> None: ...
     def update_model_version(self, version: int) -> None: ...
 
 
@@ -615,10 +616,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self.rollout_worker.pause()
 
         self.accelerator.wait_for_everyone()
+
+        # All ranks must call save_pretrained so that FSDP2 DTensor full_tensor() collectives
+        # (which are all-gathers) don't deadlock. Only rank 0 actually writes files to disk.
+        unwrapped = self.accelerator.unwrap_model(self.model)
         if self.accelerator.is_main_process:
-            unwrapped = self.accelerator.unwrap_model(self.model)
             logger.info(f"Weight sync (LoRA): saving adapter to {adapter_path}...")
-            unwrapped.save_pretrained(adapter_path)
+        unwrapped.save_pretrained(adapter_path, is_main_process=self.accelerator.is_main_process)
+        if self.accelerator.is_main_process:
             os.sync()
             t_save = time.time()
             logger.info(f"Weight sync (LoRA): save took {t_save - t0:.1f}s")
