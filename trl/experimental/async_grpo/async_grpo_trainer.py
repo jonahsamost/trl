@@ -272,7 +272,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
     def __init__(
         self,
         model: str,
-        reward_funcs: RewardFunc | list[RewardFunc],
+        reward_funcs: RewardFunc | list[RewardFunc] | None = None,
         args: AsyncGRPOConfig | None = None,
         train_dataset: Dataset | IterableDataset | None = None,
         processing_class: PreTrainedTokenizerBase | None = None,
@@ -318,7 +318,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
             processing_class.pad_token = processing_class.eos_token
 
         # Reward functions
-        if not isinstance(reward_funcs, list):
+        if rollout_worker is None and reward_funcs is None:
+            raise ValueError("reward_funcs is required when no custom rollout_worker is provided")
+        if reward_funcs is not None and not isinstance(reward_funcs, list):
             reward_funcs = [reward_funcs]
 
         # Initialize the Trainer
