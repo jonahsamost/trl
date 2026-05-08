@@ -34,7 +34,7 @@ from transformers.data.data_collator import DataCollatorMixin
 from trl.trainer.base_trainer import _BaseTrainer
 from trl.trainer.utils import pad, patch_chunked_lm_head
 
-from .async_grpo_config import AsyncGRPOConfig
+from .async_grpo_config import AsyncGRPOConfig, LossFns
 from .async_rollout_worker import AsyncRolloutWorker
 
 
@@ -288,10 +288,16 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self.epsilon_low = self.args.epsilon
         self.epsilon_high = self.args.epsilon_high
         self.temperature = self.args.temperature
+        self.loss_type = LossFns(self.args.loss_type)
+        self.cispo_clip_max = self.args.cispo_clip_max
+        self.fp32_lm_head = self.args.fp32_lm_head
 
         # Model
         model_name = model
-        model = AutoModelForCausalLM.from_pretrained(model, device_map=None, dtype=torch.float32)
+        # When fp32_lm_head is True load model body in bf16 for memory savings, but compute
+        # the LM head matmul in fp32 (handled by _ChunkedLogProbFunction)
+        load_dtype = torch.bfloat16 if self.fp32_lm_head else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(model, device_map=None, dtype=load_dtype)
 
         if self.args.use_lora:
             lora_count = 0
@@ -309,7 +315,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
         if self.args.use_liger_kernel:
             raise NotImplementedError("`use_liger_kernel` is not supported yet.")
 
-        patch_chunked_lm_head(model, chunk_size=8192, temperature=self.temperature)
+        patch_chunked_lm_head(
+            model, chunk_size=8192, temperature=self.temperature, fp32_lm_head=self.fp32_lm_head
+        )
 
         # Processing class
         if processing_class is None:
@@ -483,8 +491,20 @@ class AsyncGRPOTrainer(_BaseTrainer):
         advantages = advantages.unsqueeze(1)
         log_ratio = log_probs - old_log_probs
         ratio = torch.exp(log_ratio)
-        clipped = torch.clamp(ratio, 1 - self.epsilon_low, 1 + self.epsilon_high)
-        per_token_loss = -torch.min(ratio * advantages, clipped * advantages)
+        if self.loss_type == LossFns.CISPO:
+            is_weight = torch.clamp(ratio, max=self.cispo_clip_max).detach()
+            per_token_loss = -(is_weight * advantages * log_probs)
+
+            self._metrics["train"]["mean_is_weight"].append(is_weight.mean().item())
+            self._metrics["train"]["max_is_weight"].append(is_weight.max().item())
+            clamped = (ratio > self.cispo_clip_max).flatten().sum() / ratio.numel()
+            self._metrics["train"]["frac_clamped"].append(clamped.item())
+
+        elif self.loss_type == LossFns.GRPO:
+            clipped = torch.clamp(ratio, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            per_token_loss = -torch.min(ratio * advantages, clipped * advantages)
+        else:
+            raise ValueError(f"Unknown loss type: {self.loss_type}")
 
         # DDP/FSDP averages gradients across ranks (world_size).
         # To get correct per-token normalization we scale by 1/tokens_per_rank

@@ -13,8 +13,18 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 from trl.trainer.base_config import _BaseConfig
+
+
+class LossFns(Enum):
+    CISPO = "cispo"
+    GRPO = "grpo"
+
+    @classmethod
+    def values(cls) -> list[str]:
+        return [e.value for e in cls]
 
 
 @dataclass
@@ -58,6 +68,12 @@ class AsyncGRPOConfig(_BaseConfig):
             Lower-bound epsilon value for clipping.
         epsilon_high (`float`, *optional*, defaults to `0.2`):
             Upper-bound epsilon value for clipping.
+        loss_type (`str`, *optional*, defaults to `cispo`):
+            Which loss function to use (options include (`cispo` and `grpo`))
+        cispo_clip_max (`float`, *optional*, defaults to `5.0`):
+            Truncation threshold when using the `cispo` loss function
+        fp32_lm_head (`bool`, *optional*, default to `True`):
+            Whether or not to set the LM head to fp32 and train in bf16
 
         > Parameters that control the async rollout pipeline
 
@@ -157,6 +173,18 @@ class AsyncGRPOConfig(_BaseConfig):
         default=0.2,
         metadata={"help": "Upper-bound epsilon value for clipping."},
     )
+    loss_type: str = field(
+        default=LossFns.CISPO.value,
+        metadata={"help": f"Loss type to use, options are {LossFns.values()}`"}
+    )
+    cispo_clip_max: float = field(
+        default=5.0,
+        metadata={"help": "Truncation threshold when using the `cispo` loss function"}
+    )
+    fp32_lm_head: bool = field(
+        default=True,
+        metadata={"help": "Use FP32 precision at the LM head for logit computation"}
+    )    
 
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(
@@ -227,6 +255,9 @@ class AsyncGRPOConfig(_BaseConfig):
 
         if self.use_lora and not self.lora_adapter_path:
             raise ValueError("lora_adapter_path is required when use_lora=True")
+        
+        if self.loss_type not in LossFns.values():
+            raise ValueError(f"Loss type not supported. Supported options are: {LossFns.values()}")
 
         # Accelerator config: required for the async IterableDataset-backed dataloader to work correctly.
         # split_batches=True and dispatch_batches=True ensure that the main process drives the dataloader

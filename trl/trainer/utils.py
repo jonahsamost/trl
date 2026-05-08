@@ -1221,6 +1221,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         temperature: float,
         chunk_size: int,
         logit_scale: float = 1.0,
+        fp32_lm_head: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         device = last_hidden.device
         N, _ = last_hidden.shape
@@ -1234,6 +1235,9 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         target_logit = torch.zeros((N,), device=device, dtype=torch.float32)
 
         # Pre-allocate reusable buffers to avoid per-chunk allocation
+        if fp32_lm_head:
+            last_hidden = last_hidden.float()
+
         mm_buf = torch.empty((N, chunk_size), device=device, dtype=last_hidden.dtype)
         logits_buf = torch.empty((N, chunk_size), device=device, dtype=torch.float32)
 
@@ -1272,6 +1276,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         ctx.temperature = temperature
         ctx.chunk_size = chunk_size
         ctx.logit_scale = logit_scale
+        ctx.fp32_lm_head = fp32_lm_head
 
         return logprobs, entropy
 
@@ -1281,7 +1286,11 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         temperature: float = ctx.temperature
         chunk_size: int = ctx.chunk_size
         logit_scale: float = ctx.logit_scale
+        fp32_lm_head: bool = ctx.fp32_lm_head
         inv_t = logit_scale / temperature
+
+        if fp32_lm_head:
+            hidden = hidden.float()
 
         N, _ = hidden.shape
         vocab = weight.shape[0]
@@ -1323,7 +1332,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None, None, None, None
 
 
-def patch_chunked_lm_head(model: torch.nn.Module, chunk_size: int, temperature: float) -> None:
+def patch_chunked_lm_head(model: torch.nn.Module, chunk_size: int, temperature: float, fp32_lm_head: bool = False) -> None:
     if getattr(model.config, "final_logit_softcapping", None) is not None:
         raise NotImplementedError(
             "The model uses `final_logit_softcapping` which is not yet supported. Please open an issue if you "
@@ -1363,7 +1372,8 @@ def patch_chunked_lm_head(model: torch.nn.Module, chunk_size: int, temperature: 
             targets_flat = targets_flat[valid_mask]  # [N_valid]
 
         logprobs_valid, entropy_valid = _ChunkedLogProbFunction.apply(
-            hidden_flat, self.lm_head.weight, targets_flat, temperature, chunk_size, logit_scale
+            hidden_flat, self.lm_head.weight, targets_flat, temperature,
+            chunk_size, logit_scale, fp32_lm_head
         )
 
         if valid_mask is not None:
