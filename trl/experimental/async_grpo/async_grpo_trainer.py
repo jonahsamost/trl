@@ -111,6 +111,8 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                 "completion_mask": sample.completion_mask,
                 "old_log_probs": sample.old_log_probs,
                 "advantage": sample.advantage,
+                "prompt_total_tokens": sample.prompt_total_tokens,
+                "prompt_group_id": sample.prompt_group_id,
                 "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s},
             }
 
@@ -465,7 +467,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "completion_mask",
                 "old_log_probs",
                 "advantages",
+                "prompt_total_tokens",
                 "global_n_tokens",
+                "global_num_prompts",
                 "metrics",
             ]
 
