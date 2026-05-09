@@ -697,9 +697,9 @@ class AsyncRolloutWorker:
         # and use nansum so that a None from one function doesn't affect the others, matching TRL.
         all_rewards = [[r if r is not None else float("nan") for r in row] for row in all_rewards]
         rewards = np.nansum(np.array(all_rewards, dtype=float), axis=0)
-        advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         reward_mean = float(rewards.mean())
         reward_std = float(rewards.std())
+        advantages = rewards - reward_mean
         logger.info(f"Rollout metrics: reward_mean={reward_mean:.4f}, reward_std={reward_std:.4f}")
 
         # tools/call_frequency: mean calls per completion (matches TRL's total_calls / num_completions)

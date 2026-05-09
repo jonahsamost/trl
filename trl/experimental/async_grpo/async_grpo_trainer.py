@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+import numpy as np
 import torch
 from accelerate.logging import get_logger
 from datasets import Dataset, IterableDataset
@@ -34,7 +35,7 @@ from transformers.data.data_collator import DataCollatorMixin
 from trl.trainer.base_trainer import _BaseTrainer
 from trl.trainer.utils import pad, patch_chunked_lm_head
 
-from .async_grpo_config import AsyncGRPOConfig, LossFns, LossAggregation
+from .async_grpo_config import AsyncGRPOConfig, AdvantageNormalization, LossFns, LossAggregation
 from .async_rollout_worker import AsyncRolloutWorker
 
 
@@ -80,41 +81,79 @@ class StepIntervalCallback(TrainerCallback):
 
 
 class RolloutQueueDataset(torch.utils.data.IterableDataset):
-    def __init__(self, rollout_queue, model_version_fn, max_staleness=3, timeout=120.0):
+    def __init__(self, rollout_queue, model_version_fn, max_staleness=3, timeout=120.0, full_batch_size=None):
         self.queue = rollout_queue
         self.model_version_fn = model_version_fn
         self.max_staleness = max_staleness
         self.timeout = timeout
+        self.full_batch_size = full_batch_size
 
-    def __iter__(self):
+    def _pull_non_stale(self):
+        """Pull the next non-stale sample from the queue, or None on timeout."""
         while True:
             t0 = time.time()
-            qsize = self.queue.qsize()
-            if qsize == 0:
-                logger.info("queue empty, waiting for rollout samples...")
             try:
                 sample = self.queue.get(timeout=self.timeout)
             except queue.Empty:
-                logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
-                return  # StopIteration ends epoch
-            queue_wait_time_s = time.time() - t0
-            if queue_wait_time_s > 1.0:
-                logger.info(f"waited {queue_wait_time_s:.1f}s for sample (qsize={self.queue.qsize()})")
+                return None, 0.0
+            wait_s = time.time() - t0
 
             staleness = self.model_version_fn() - sample.model_version
             if staleness > self.max_staleness:
                 logger.info(f"dropping stale sample (staleness={staleness}, max={self.max_staleness})")
-                continue  # drop stale, pull next
+                continue
+            return sample, wait_s
 
-            yield {
-                "input_ids": sample.input_ids,
-                "completion_mask": sample.completion_mask,
-                "old_log_probs": sample.old_log_probs,
-                "advantage": sample.advantage,
-                "prompt_total_tokens": sample.prompt_total_tokens,
-                "prompt_group_id": sample.prompt_group_id,
-                "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s},
-            }
+    def _sample_to_dict(self, sample, queue_wait_time_s, batch_adv_std):
+        return {
+            "input_ids": sample.input_ids,
+            "completion_mask": sample.completion_mask,
+            "old_log_probs": sample.old_log_probs,
+            "advantage": sample.advantage,
+            "prompt_total_tokens": sample.prompt_total_tokens,
+            "prompt_group_id": sample.prompt_group_id,
+            "batch_adv_std": batch_adv_std,
+            "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s},
+        }
+
+    def __iter__(self):
+        while True:
+            if self.full_batch_size and self.full_batch_size >= 1:
+                buffer = []
+                wait_times = []
+                while len(buffer) < self.full_batch_size:
+                    if not buffer and self.queue.qsize() == 0:
+                        logger.info("queue empty, waiting for rollout samples...")
+                    sample, wait_s = self._pull_non_stale()
+                    if sample is None:
+                        logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
+                        if buffer:
+                            break
+                        return
+                    buffer.append(sample)
+                    wait_times.append(wait_s)
+
+                advs = np.array([s.advantage for s in buffer], dtype=np.float64)
+                batch_adv_std = float(advs.std()) + 1e-8
+
+                if len(buffer) < self.full_batch_size:
+                    logger.warning(
+                        "partial batch for adv normalization: %d/%d samples (adv_std=%.6f)",
+                        len(buffer), self.full_batch_size, batch_adv_std,
+                    )
+
+                for sample, wait_s in zip(buffer, wait_times):
+                    yield self._sample_to_dict(sample, wait_s, batch_adv_std)
+            else:
+                if self.queue.qsize() == 0:
+                    logger.info("queue empty, waiting for rollout samples...")
+                sample, wait_s = self._pull_non_stale()
+                if sample is None:
+                    logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
+                    return
+                if wait_s > 1.0:
+                    logger.info(f"waited {wait_s:.1f}s for sample (qsize={self.queue.qsize()})")
+                yield self._sample_to_dict(sample, wait_s, 0.0)
 
 
 class _EmptyIterableDataset(torch.utils.data.IterableDataset):
@@ -135,6 +174,7 @@ class DataCollatorForRollout(DataCollatorMixin):
         completion_mask = [torch.tensor(example["completion_mask"], dtype=torch.float32) for example in examples]
         old_log_probs = [torch.tensor(example["old_log_probs"], dtype=torch.float32) for example in examples]
         advantages = torch.tensor([example["advantage"] for example in examples], dtype=torch.float32)
+        batch_adv_std = torch.tensor([example["batch_adv_std"] for example in examples], dtype=torch.float32)
         prompt_total_tokens = torch.tensor(
             [example["prompt_total_tokens"] for example in examples], dtype=torch.float32
         )
@@ -172,6 +212,7 @@ class DataCollatorForRollout(DataCollatorMixin):
             "completion_mask": completion_mask,
             "old_log_probs": old_log_probs,
             "advantages": advantages,
+            "batch_adv_std": batch_adv_std,
             "prompt_total_tokens": prompt_total_tokens,
             "global_n_tokens": global_n_tokens_repeated,
             "global_num_prompts": global_num_prompts_repeated,
@@ -303,6 +344,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self.cispo_clip_max = self.args.cispo_clip_max
         self.fp32_lm_head = self.args.fp32_lm_head
         self.loss_aggregation = LossAggregation(self.args.loss_aggregation)
+        self.advantage_normalization = AdvantageNormalization(self.args.advantage_normalization)
 
         # Model
         model_name = model
@@ -433,12 +475,18 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self.add_callback(StepIntervalCallback(self._sync_weight, self.args.weight_sync_steps))
 
     def get_train_dataloader(self) -> DataLoader:
+        full_batch_size = (
+            self.args.per_device_train_batch_size
+            * self.args.gradient_accumulation_steps
+            * self.accelerator.num_processes
+        )
         if self.accelerator.is_main_process:
             dataset = RolloutQueueDataset(
                 rollout_queue=self.rollout_queue,
                 model_version_fn=lambda: self.model_version,
                 max_staleness=self.args.max_staleness,
                 timeout=self.args.vllm_server_timeout,
+                full_batch_size=full_batch_size if self.advantage_normalization == AdvantageNormalization.BATCH else None,
             )
         else:
             dataset = _EmptyIterableDataset()
@@ -467,6 +515,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "completion_mask",
                 "old_log_probs",
                 "advantages",
+                "batch_adv_std",
                 "prompt_total_tokens",
                 "global_n_tokens",
                 "global_num_prompts",
@@ -502,6 +551,18 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         completion_mask = completion_mask[:, 1:]
         old_log_probs = old_log_probs[:, 1:]
+
+        if self.advantage_normalization == AdvantageNormalization.BATCH:
+            adv_std = inputs["batch_adv_std"][0]
+            advantages = advantages / adv_std
+            self._metrics["train"]["adv_std_batch"].append(adv_std.item())
+        elif self.advantage_normalization == AdvantageNormalization.GROUP:
+            group_std = inputs["metrics"]["reward_std"].to(advantages.device)
+            advantages = advantages / (group_std + 1e-8)
+            self._metrics["train"]["adv_std_group"].append(group_std.mean().item())
+        else:
+            self._metrics["train"]["adv_std_raw"].append(advantages.std().item())
+
         advantages = advantages.unsqueeze(1)
         log_ratio = log_probs - old_log_probs
         ratio = torch.exp(log_ratio)

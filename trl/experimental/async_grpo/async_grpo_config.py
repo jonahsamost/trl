@@ -34,6 +34,12 @@ class LossAggregation(BaseEnum):
     PROMPT = "prompt"
 
 
+class AdvantageNormalization(BaseEnum):
+    GROUP = "group"
+    BATCH = "batch"
+    NONE = "none"
+
+
 @dataclass
 class AsyncGRPOConfig(_BaseConfig):
     # docstyle-ignore
@@ -83,6 +89,10 @@ class AsyncGRPOConfig(_BaseConfig):
             Whether or not to set the LM head to fp32 and train in bf16
         loss_aggregation (`str`, *optional*, defaults to `token`):
             Whether to aggregate losses over tokens, prompt, or sample
+        advantage_normalization (`str`, *optional*, defaults to `batch`):
+            How to normalize advantages. 'group' normalizes within each prompt group (GRPO-style),
+            'batch' centers within groups then normalizes by the batch-wide std (ScaleRL), 'none'
+            uses raw centered advantages with no variance scaling.
 
         > Parameters that control the async rollout pipeline
 
@@ -198,6 +208,11 @@ class AsyncGRPOConfig(_BaseConfig):
         default=LossAggregation.PROMPT.value,
         metadata={"help": "Loss aggregation strategy: 'token' (global token avg), 'sample' (per-sample avg), 'prompt' (per-prompt avg)"},
     )
+    advantage_normalization: str = field(
+        default=AdvantageNormalization.BATCH.value,
+        metadata={"help": "Advantage normalization: 'group' (GRPO per-group std), 'batch' (ScaleRL batch-wide std), 'none' (raw centered)"},
+    )
+
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(
         default=-1,
@@ -273,6 +288,9 @@ class AsyncGRPOConfig(_BaseConfig):
         
         if self.loss_aggregation not in LossAggregation.values():
             raise ValueError(f"Loss aggregation not supported. Supported options are: {LossAggregation.values()}")
+
+        if self.advantage_normalization not in AdvantageNormalization.values():
+            raise ValueError(f"Advantage normalization not supported. Supported options are: {AdvantageNormalization.values()}")
 
         # Accelerator config: required for the async IterableDataset-backed dataloader to work correctly.
         # split_batches=True and dispatch_batches=True ensure that the main process drives the dataloader
