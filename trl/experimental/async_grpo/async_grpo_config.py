@@ -17,14 +17,21 @@ from enum import Enum
 
 from trl.trainer.base_config import _BaseConfig
 
-
-class LossFns(Enum):
-    CISPO = "cispo"
-    GRPO = "grpo"
-
+class BaseEnum(Enum):
     @classmethod
     def values(cls) -> list[str]:
         return [e.value for e in cls]
+
+
+class LossFns(BaseEnum):
+    CISPO = "cispo"
+    GRPO = "grpo"
+
+
+class LossAggregation(BaseEnum):
+    TOKEN = "token"
+    SAMPLE = "sample"
+    PROMPT = "prompt"
 
 
 @dataclass
@@ -74,6 +81,8 @@ class AsyncGRPOConfig(_BaseConfig):
             Truncation threshold when using the `cispo` loss function
         fp32_lm_head (`bool`, *optional*, default to `True`):
             Whether or not to set the LM head to fp32 and train in bf16
+        loss_aggregation (`str`, *optional*, defaults to `token`):
+            Whether to aggregate losses over tokens, prompt, or sample
 
         > Parameters that control the async rollout pipeline
 
@@ -185,7 +194,10 @@ class AsyncGRPOConfig(_BaseConfig):
         default=True,
         metadata={"help": "Use FP32 precision at the LM head for logit computation"}
     )    
-
+    loss_aggregation: str = field(
+        default=LossAggregation.PROMPT.value,
+        metadata={"help": "Loss aggregation strategy: 'token' (global token avg), 'sample' (per-sample avg), 'prompt' (per-prompt avg)"},
+    )
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(
         default=-1,
@@ -258,6 +270,9 @@ class AsyncGRPOConfig(_BaseConfig):
         
         if self.loss_type not in LossFns.values():
             raise ValueError(f"Loss type not supported. Supported options are: {LossFns.values()}")
+        
+        if self.loss_aggregation not in LossAggregation.values():
+            raise ValueError(f"Loss aggregation not supported. Supported options are: {LossAggregation.values()}")
 
         # Accelerator config: required for the async IterableDataset-backed dataloader to work correctly.
         # split_batches=True and dispatch_batches=True ensure that the main process drives the dataloader

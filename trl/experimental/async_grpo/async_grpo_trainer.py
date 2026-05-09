@@ -34,7 +34,7 @@ from transformers.data.data_collator import DataCollatorMixin
 from trl.trainer.base_trainer import _BaseTrainer
 from trl.trainer.utils import pad, patch_chunked_lm_head
 
-from .async_grpo_config import AsyncGRPOConfig, LossFns
+from .async_grpo_config import AsyncGRPOConfig, LossFns, LossAggregation
 from .async_rollout_worker import AsyncRolloutWorker
 
 
@@ -133,6 +133,10 @@ class DataCollatorForRollout(DataCollatorMixin):
         completion_mask = [torch.tensor(example["completion_mask"], dtype=torch.float32) for example in examples]
         old_log_probs = [torch.tensor(example["old_log_probs"], dtype=torch.float32) for example in examples]
         advantages = torch.tensor([example["advantage"] for example in examples], dtype=torch.float32)
+        prompt_total_tokens = torch.tensor(
+            [example["prompt_total_tokens"] for example in examples], dtype=torch.float32
+        )
+        prompt_group_ids = [example["prompt_group_id"] for example in examples]
 
         input_ids = pad(input_ids, padding_value=self.pad_token_id)
         attention_mask = pad(attention_mask, padding_value=0)
@@ -143,6 +147,9 @@ class DataCollatorForRollout(DataCollatorMixin):
         # Repeated per sample so that DataLoaderDispatcher (dispatch_batches=True) slices correctly on dim=0
         global_n_tokens = completion_mask.sum()
         global_n_tokens_repeated = torch.full((len(examples),), global_n_tokens.item(), dtype=torch.float32)
+
+        global_num_prompts = len(set(prompt_group_ids))
+        global_num_prompts_repeated = torch.full((len(examples),), global_num_prompts, dtype=torch.float32)
 
         # Convert per-sample metrics dicts to a dict of 1D tensors so that Accelerate's
         # recursive broadcast (dispatch_batches=True) can handle them — it traverses nested
@@ -163,7 +170,9 @@ class DataCollatorForRollout(DataCollatorMixin):
             "completion_mask": completion_mask,
             "old_log_probs": old_log_probs,
             "advantages": advantages,
+            "prompt_total_tokens": prompt_total_tokens,
             "global_n_tokens": global_n_tokens_repeated,
+            "global_num_prompts": global_num_prompts_repeated,
             "metrics": metrics,
         }
 
@@ -291,6 +300,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self.loss_type = LossFns(self.args.loss_type)
         self.cispo_clip_max = self.args.cispo_clip_max
         self.fp32_lm_head = self.args.fp32_lm_head
+        self.loss_aggregation = LossAggregation(self.args.loss_aggregation)
 
         # Model
         model_name = model
@@ -506,16 +516,33 @@ class AsyncGRPOTrainer(_BaseTrainer):
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
-        # DDP/FSDP averages gradients across ranks (world_size).
-        # To get correct per-token normalization we scale by 1/tokens_per_rank
-        # = world_size / global_n_tokens, so after DDP averaging the effective
-        loss = (per_token_loss * completion_mask).sum()
-        global_n_tokens = inputs["global_n_tokens"][0]
         world_size = self.accelerator.num_processes
-        tokens_per_rank = (global_n_tokens / world_size).clamp(min=1.0)
-        loss = loss / tokens_per_rank.to(torch.float32)
-        # For DAPO, we would scale like this instead:
-        # loss = loss / max(per_token_loss.size(0), 1)
+        if self.loss_aggregation == LossAggregation.PROMPT:
+            # First sum all token losses across all G completions for a prompt, then divide
+            # by the total completion tokens for that prompt, then average across all prompts
+            # i.e. the mean of the per-prompt average-token-losses
+            prompt_total_tokens = inputs["prompt_total_tokens"].unsqueeze(1)  # [B, 1]
+            weighted = per_token_loss * completion_mask / prompt_total_tokens.clamp(min=1.0)
+            global_num_prompts = inputs["global_num_prompts"][0]
+            prompts_per_rank = (global_num_prompts / world_size).clamp(min=1.0)
+            loss = weighted.sum() / prompts_per_rank
+        elif self.loss_aggregation == LossAggregation.SAMPLE:
+            # First average tokens within each sample (i.e. completion), then average across samples
+            # Meaning that every sample (each completion) has equal weight, regardless of length
+            per_sample_loss = (per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1)
+            loss = per_sample_loss.mean()
+        else:
+            # Sum all token losses in the batch, and divide by total number of tokens
+            # Meaning that every token in the batch has equal weight
+            
+            # DDP/FSDP averages gradients across ranks (world_size).
+            # To get correct per-token normalization we scale by 1/tokens_per_rank
+            # = world_size / global_n_tokens, so after DDP averaging the effective
+            global_n_tokens = inputs["global_n_tokens"][0]
+            loss = (per_token_loss * completion_mask).sum()
+            tokens_per_rank = (global_n_tokens / world_size).clamp(min=1.0)
+            loss = loss / tokens_per_rank.to(torch.float32)
+
         loss = loss / self.current_gradient_accumulation_steps
 
         with torch.no_grad():

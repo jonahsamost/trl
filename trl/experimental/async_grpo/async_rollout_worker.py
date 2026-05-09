@@ -62,6 +62,7 @@ class RolloutGroup:
     tool_call_counts: list[int]
     tool_failure_counts: list[int]
     model_version: int
+    prompt_group_id: int = 0
     queued_at: float = 0.0
 
 
@@ -73,6 +74,8 @@ class RolloutSample:
     completion_mask: list[int]
     old_log_probs: list[float]
     advantage: float
+    prompt_total_tokens: int  # sum of completion tokens across all G generations for this prompt
+    prompt_group_id: int  # unique identifier for the prompt group (used by collator to count global prompts)
     model_version: int
     metrics: dict[str, float]  # logging metadata only, not used in loss computation
 
@@ -378,6 +381,7 @@ class AsyncRolloutWorker:
                             tool_call_counts=[],
                             tool_failure_counts=[],
                             model_version=self.model_version,
+                            prompt_group_id=group_id,
                         )
                         pending_completed[group_id] = 0
                         logger.debug(f"Started group {group_id}; pending_groups={len(pending_groups)}")
@@ -715,6 +719,7 @@ class AsyncRolloutWorker:
         )
 
         per_func_rewards = np.array(all_rewards, dtype=float)  # shape (num_funcs, num_completions)
+        prompt_total_tokens = sum(sum(mask) for mask in group.tool_mask)
 
         return [
             RolloutSample(
@@ -724,6 +729,8 @@ class AsyncRolloutWorker:
                 completion_mask=[0] * len(group.prompt_ids) + tool_mask,
                 old_log_probs=[0.0] * len(group.prompt_ids) + logprobs,
                 advantage=advantage,
+                prompt_total_tokens=prompt_total_tokens,
+                prompt_group_id=group.prompt_group_id,
                 model_version=group.model_version,
                 metrics={
                     "reward": float(reward),
