@@ -95,16 +95,16 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
             try:
                 sample = self.queue.get(timeout=self.timeout)
             except queue.Empty:
-                return None, 0.0
+                return None, 0.0, 0
             wait_s = time.time() - t0
 
             staleness = self.model_version_fn() - sample.model_version
             if staleness > self.max_staleness:
                 logger.info(f"dropping stale sample (staleness={staleness}, max={self.max_staleness})")
                 continue
-            return sample, wait_s
+            return sample, wait_s, staleness
 
-    def _sample_to_dict(self, sample, queue_wait_time_s, batch_adv_std):
+    def _sample_to_dict(self, sample, queue_wait_time_s, batch_adv_std, staleness):
         return {
             "input_ids": sample.input_ids,
             "completion_mask": sample.completion_mask,
@@ -113,7 +113,7 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
             "prompt_total_tokens": sample.prompt_total_tokens,
             "prompt_group_id": sample.prompt_group_id,
             "batch_adv_std": batch_adv_std,
-            "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s},
+            "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s, "staleness": float(staleness)},
         }
 
     def __iter__(self):
@@ -121,10 +121,11 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
             if self.full_batch_size and self.full_batch_size >= 1:
                 buffer = []
                 wait_times = []
+                staleness_vals = []
                 while len(buffer) < self.full_batch_size:
                     if not buffer and self.queue.qsize() == 0:
                         logger.info("queue empty, waiting for rollout samples...")
-                    sample, wait_s = self._pull_non_stale()
+                    sample, wait_s, staleness = self._pull_non_stale()
                     if sample is None:
                         logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
                         if buffer:
@@ -132,6 +133,7 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                         return
                     buffer.append(sample)
                     wait_times.append(wait_s)
+                    staleness_vals.append(staleness)
 
                 advs = np.array([s.advantage for s in buffer], dtype=np.float64)
                 batch_adv_std = float(advs.std()) + 1e-8
@@ -142,18 +144,18 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                         len(buffer), self.full_batch_size, batch_adv_std,
                     )
 
-                for sample, wait_s in zip(buffer, wait_times):
-                    yield self._sample_to_dict(sample, wait_s, batch_adv_std)
+                for sample, wait_s, staleness in zip(buffer, wait_times, staleness_vals):
+                    yield self._sample_to_dict(sample, wait_s, batch_adv_std, staleness)
             else:
                 if self.queue.qsize() == 0:
                     logger.info("queue empty, waiting for rollout samples...")
-                sample, wait_s = self._pull_non_stale()
+                sample, wait_s, staleness = self._pull_non_stale()
                 if sample is None:
                     logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
                     return
                 if wait_s > 1.0:
                     logger.info(f"waited {wait_s:.1f}s for sample (qsize={self.queue.qsize()})")
-                yield self._sample_to_dict(sample, wait_s, 0.0)
+                yield self._sample_to_dict(sample, wait_s, 0.0, staleness)
 
 
 class _EmptyIterableDataset(torch.utils.data.IterableDataset):
