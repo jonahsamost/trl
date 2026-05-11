@@ -216,6 +216,18 @@ class AsyncGRPOConfig(_BaseConfig):
         default=True,
         metadata={"help": "Drop prompt groups where all G generations received identical rewards (zero advantage, zero gradient)."},
     )
+    no_positive_resample: bool = field(
+        default=True,
+        metadata={"help": "Retire prompts whose historical pass rate exceeds the threshold, removing them from future training."},
+    )
+    no_positive_resample_threshold: float = field(
+        default=0.9,
+        metadata={"help": "Pass-rate threshold above which a prompt is permanently retired."},
+    )
+    no_positive_resample_min_samples: int = field(
+        default=16,
+        metadata={"help": "Minimum number of binary outcomes observed before a prompt can be retired."},
+    )
 
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(

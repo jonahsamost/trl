@@ -466,6 +466,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     use_lora=self.args.use_lora,
                     lora_name=self.args.lora_name,
                     filter_zero_variance=self.args.filter_zero_variance,
+                    no_positive_resample=self.args.no_positive_resample,
+                    no_positive_resample_threshold=self.args.no_positive_resample_threshold,
+                    no_positive_resample_min_samples=self.args.no_positive_resample_min_samples,
                 )
             self.rollout_queue = self.rollout_worker.rollout_buffer
         else:

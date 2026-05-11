@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import asyncio
+import hashlib
 import inspect
+import json
 import queue
 import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TypeAlias
 
 import aiohttp
@@ -48,6 +51,83 @@ logger = get_logger(__name__)
 Messages: TypeAlias = list[dict[str, str]]
 
 
+def _hash_prompt(prompt: Messages) -> str:
+    """Deterministic hash for a chat-style prompt (list of message dicts)."""
+    return hashlib.md5(json.dumps(prompt, sort_keys=True).encode()).hexdigest()
+
+
+class PromptPassRateTracker:
+    """Tracks per-prompt mean reward across epochs and retires mastered prompts.
+
+    Stores raw reward values (not binarized) so it works naturally with both
+    binary rewards (±1 for math verification) and continuous rewards (LLM-as-a-judge).
+    A prompt is retired when its mean reward meets or exceeds ``threshold`` and at
+    least ``min_samples`` reward observations have been recorded.
+
+    Thread-safe: all mutations go through a lock so the tracker can be shared
+    between the generate loop (which calls ``should_skip``) and the score loop
+    (which calls ``update``).
+    """
+
+    def __init__(self, threshold: float = 0.9, min_samples: int = 16):
+        self.threshold = threshold
+        self.min_samples = min_samples
+        self._history: dict[str, list[float]] = {}
+        self._retired: set[str] = set()
+        self._lock = threading.Lock()
+
+    def update(self, prompt_hash: str, rewards: list[float]) -> None:
+        """Record reward observations for a prompt and retire if mastered."""
+        with self._lock:
+            if prompt_hash in self._retired:
+                return
+            self._history.setdefault(prompt_hash, []).extend(rewards)
+            history = self._history[prompt_hash]
+            if len(history) >= self.min_samples:
+                mean_reward = sum(history) / len(history)
+                if mean_reward >= self.threshold:
+                    self._retired.add(prompt_hash)
+                    logger.info(
+                        "Retired prompt %s (mean_reward=%.3f, n=%d)",
+                        prompt_hash[:12], mean_reward, len(history),
+                    )
+
+    def should_skip(self, prompt_hash: str) -> bool:
+        with self._lock:
+            return prompt_hash in self._retired
+
+    @property
+    def num_retired(self) -> int:
+        with self._lock:
+            return len(self._retired)
+
+    @property
+    def num_tracked(self) -> int:
+        with self._lock:
+            return len(self._history)
+
+    def save(self, path: str | Path) -> None:
+        with self._lock:
+            data = {
+                "threshold": self.threshold,
+                "min_samples": self.min_samples,
+                "history": self._history,
+                "retired": sorted(self._retired),
+            }
+        Path(path).write_text(json.dumps(data))
+
+    @classmethod
+    def load(cls, path: str | Path, **overrides: Any) -> "PromptPassRateTracker":
+        data = json.loads(Path(path).read_text())
+        tracker = cls(
+            threshold=overrides.get("threshold", data["threshold"]),
+            min_samples=overrides.get("min_samples", data["min_samples"]),
+        )
+        tracker._history = data["history"]
+        tracker._retired = set(data["retired"])
+        return tracker
+
+
 @dataclass(slots=True)
 class RolloutGroup:
     """Single GRPO group for one prompt with multiple completions."""
@@ -63,6 +143,7 @@ class RolloutGroup:
     tool_failure_counts: list[int]
     model_version: int
     prompt_group_id: int = 0
+    prompt_hash: str = ""
     queued_at: float = 0.0
 
 
@@ -113,6 +194,9 @@ class AsyncRolloutWorker:
         use_lora: bool = False,
         lora_name: str | None = None,
         filter_zero_variance: bool = True,
+        no_positive_resample: bool = True,
+        no_positive_resample_threshold: float = 0.9,
+        no_positive_resample_min_samples: int = 16,
     ):
         if not is_vllm_available(min_version="0.17.1"):
             raise ImportError(
@@ -120,6 +204,12 @@ class AsyncRolloutWorker:
             )
         self.lora_sync = use_lora
         self.filter_zero_variance = filter_zero_variance
+        self.no_positive_resample = no_positive_resample
+        self.pass_rate_tracker: PromptPassRateTracker | None = (
+            PromptPassRateTracker(threshold=no_positive_resample_threshold, min_samples=no_positive_resample_min_samples)
+            if no_positive_resample
+            else None
+        )
         self.max_tool_calling_iterations = max_tool_calling_iterations
         self.dataset = dataset
         self._dataset_iter = iter(dataset)
@@ -384,6 +474,7 @@ class AsyncRolloutWorker:
                             tool_failure_counts=[],
                             model_version=self.model_version,
                             prompt_group_id=group_id,
+                            prompt_hash=_hash_prompt(prompt),
                         )
                         pending_completed[group_id] = 0
                         logger.debug(f"Started group {group_id}; pending_groups={len(pending_groups)}")
@@ -542,12 +633,29 @@ class AsyncRolloutWorker:
 
     def _repeat_iterator(self) -> Iterator[tuple[int, dict[str, Any]]]:
         group_id = 0
+        dataset_len = len(self.dataset) if hasattr(self.dataset, "__len__") else None
+        consecutive_skips = 0
         while True:
             try:
                 row = next(self._dataset_iter)
             except StopIteration:
                 self._dataset_iter = iter(self.dataset)
                 row = next(self._dataset_iter)
+
+            if self.pass_rate_tracker is not None:
+                prompt_hash = _hash_prompt(row["prompt"])
+                if self.pass_rate_tracker.should_skip(prompt_hash):
+                    consecutive_skips += 1
+                    if dataset_len and consecutive_skips >= dataset_len:
+                        logger.warning(
+                            "All %d prompts retired (num_retired=%d). "
+                            "Training data exhausted — stopping generation.",
+                            dataset_len, self.pass_rate_tracker.num_retired,
+                        )
+                        return
+                    continue
+                consecutive_skips = 0
+
             for _ in range(self.num_generations):
                 yield group_id, row
             group_id += 1
@@ -702,6 +810,9 @@ class AsyncRolloutWorker:
         reward_mean = float(rewards.mean())
         reward_std = float(rewards.std())
 
+        if self.pass_rate_tracker is not None and group.prompt_hash:
+            self.pass_rate_tracker.update(group.prompt_hash, rewards.tolist())
+
         if self.filter_zero_variance and reward_std < 1e-8:
             logger.info(
                 f"Dropping zero-variance group (prompt_group_id={group.prompt_group_id}, "
@@ -731,6 +842,11 @@ class AsyncRolloutWorker:
         per_func_rewards = np.array(all_rewards, dtype=float)  # shape (num_funcs, num_completions)
         prompt_total_tokens = sum(sum(mask) for mask in group.tool_mask)
 
+        tracker_metrics: dict[str, float] = {}
+        if self.pass_rate_tracker is not None:
+            tracker_metrics["prompts_retired"] = float(self.pass_rate_tracker.num_retired)
+            tracker_metrics["prompts_tracked"] = float(self.pass_rate_tracker.num_tracked)
+
         return [
             RolloutSample(
                 prompt=group.prompt,
@@ -750,6 +866,7 @@ class AsyncRolloutWorker:
                         for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
                     },
                     **tm,
+                    **tracker_metrics,
                 },
             )
             for i, (completion, completion_ids, logprobs, tool_mask, advantage, reward, tm) in enumerate(
