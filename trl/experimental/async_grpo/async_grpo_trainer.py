@@ -465,6 +465,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     weight_shapes=weight_shapes,
                     use_lora=self.args.use_lora,
                     lora_name=self.args.lora_name,
+                    filter_zero_variance=self.args.filter_zero_variance,
                 )
             self.rollout_queue = self.rollout_worker.rollout_buffer
         else:

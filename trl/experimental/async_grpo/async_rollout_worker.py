@@ -112,12 +112,14 @@ class AsyncRolloutWorker:
         weight_shapes: list[list[int]] | None = None,
         use_lora: bool = False,
         lora_name: str | None = None,
+        filter_zero_variance: bool = True,
     ):
         if not is_vllm_available(min_version="0.17.1"):
             raise ImportError(
                 "vLLM >= 0.17.1 is required to use AsyncRolloutWorker. Install it with: pip install 'vllm>=0.17.1'"
             )
         self.lora_sync = use_lora
+        self.filter_zero_variance = filter_zero_variance
         self.max_tool_calling_iterations = max_tool_calling_iterations
         self.dataset = dataset
         self._dataset_iter = iter(dataset)
@@ -699,6 +701,14 @@ class AsyncRolloutWorker:
         rewards = np.nansum(np.array(all_rewards, dtype=float), axis=0)
         reward_mean = float(rewards.mean())
         reward_std = float(rewards.std())
+
+        if self.filter_zero_variance and reward_std < 1e-8:
+            logger.info(
+                f"Dropping zero-variance group (prompt_group_id={group.prompt_group_id}, "
+                f"reward={rewards[0]:.4f}, n={len(rewards)})"
+            )
+            return []
+
         advantages = rewards - reward_mean
         logger.info(f"Rollout metrics: reward_mean={reward_mean:.4f}, reward_std={reward_std:.4f}")
 

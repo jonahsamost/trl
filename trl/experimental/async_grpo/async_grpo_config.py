@@ -212,6 +212,10 @@ class AsyncGRPOConfig(_BaseConfig):
         default=AdvantageNormalization.BATCH.value,
         metadata={"help": "Advantage normalization: 'group' (GRPO per-group std), 'batch' (ScaleRL batch-wide std), 'none' (raw centered)"},
     )
+    filter_zero_variance: bool = field(
+        default=True,
+        metadata={"help": "Drop prompt groups where all G generations received identical rewards (zero advantage, zero gradient)."},
+    )
 
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(
