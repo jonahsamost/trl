@@ -241,7 +241,7 @@ class AsyncGRPOConfig(_BaseConfig):
         },
     )
     max_staleness: int = field(
-        default=4,
+        default=8,
         metadata={
             "help": "Maximum number of weight update steps a rollout sample can lag behind the current model version "
             "before being discarded."
