@@ -59,9 +59,10 @@ class RolloutWorkerProtocol(Protocol):
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
-    def pause(self) -> None: ...
+    def pause(self, clear_cache: bool = False) -> None: ...
     def resume(self) -> None: ...
     def send_weights(self, iterator: Iterator[tuple[str, torch.Tensor]]) -> None: ...
+    def send_lora_weights(self, lora_param_iter: Iterator[tuple[str, torch.Tensor]], lora_alpha: float, lora_rank: int, lora_int_id: int) -> None: ...
     def reload_lora(self, adapter_path: str, lora_name: str) -> None: ...
     def update_model_version(self, version: int) -> None: ...
 
@@ -367,6 +368,16 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     "Ensure the model path contains adapter_config.json and adapter weights."
                 )
             logger.info(f"Enabled gradients on {lora_count} LoRA parameter tensors")
+
+            # Extract LoRA config for NCCL sync
+            adapter_config_path = os.path.join(self.args.lora_adapter_path, "adapter_config.json")
+            import json
+            with open(adapter_config_path) as f:
+                adapter_cfg = json.load(f)
+            self._lora_alpha = float(adapter_cfg["lora_alpha"])
+            self._lora_rank = int(adapter_cfg["r"])
+            # vLLM assigns lora_int_id = 1 for the first LoRA adapter loaded at startup
+            self._lora_int_id = 1
 
         if self.args.use_liger_kernel:
             raise NotImplementedError("`use_liger_kernel` is not supported yet.")
@@ -714,6 +725,18 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 full = full.to(device)
             yield name, full
 
+    def _lora_param_iter(self):
+        """Yield (name, tensor) for LoRA A/B parameters only."""
+        device = self.accelerator.device
+        for name, param in self.model.named_parameters():
+            if "lora_" not in name:
+                continue
+            name = name.removeprefix("module.")
+            full = param.full_tensor() if isinstance(param, DTensor) else param.detach()
+            if full.device != device:
+                full = full.to(device)
+            yield name, full
+
     def _sync_weight(self):
         t0 = time.time()
 
@@ -727,32 +750,20 @@ class AsyncGRPOTrainer(_BaseTrainer):
         logger.info(f"Weight sync: done. Total {weight_sync_time_s:.1f}s")
 
     def _sync_weight_lora(self, t0: float):
-        """LoRA sync: save adapter to disk, then tell vLLM to hot-reload it."""
-        adapter_path = self.args.lora_adapter_path
-        lora_name = self.args.lora_name
-
-        # Pause vLLM FIRST so no requests trigger lazy LoRA loading mid-write
+        """LoRA sync: stream LoRA A/B tensors to vLLM via NCCL, bypassing disk + adapter lifecycle."""
         if self.accelerator.is_main_process and self.rollout_worker:
-            self.rollout_worker.pause()
-
-        self.accelerator.wait_for_everyone()
-
-        # All ranks must call save_pretrained so that FSDP2 DTensor full_tensor() collectives
-        # (which are all-gathers) don't deadlock. Only rank 0 actually writes files to disk.
-        unwrapped = self.accelerator.unwrap_model(self.model)
-        if self.accelerator.is_main_process:
-            logger.info(f"Weight sync (LoRA): saving adapter to {adapter_path}...")
-        unwrapped.save_pretrained(adapter_path, is_main_process=self.accelerator.is_main_process)
-        if self.accelerator.is_main_process:
-            os.sync()
-            t_save = time.time()
-            logger.info(f"Weight sync (LoRA): save took {t_save - t0:.1f}s")
-
-        self.accelerator.wait_for_everyone()
+            self.rollout_worker.send_lora_weights(
+                self._lora_param_iter(),
+                lora_alpha=self._lora_alpha,
+                lora_rank=self._lora_rank,
+                lora_int_id=self._lora_int_id,
+            )
+        else:
+            # Non-rank-0 must still participate in DTensor full_tensor() collectives for FSDP2
+            for _ in self._lora_param_iter():
+                pass
 
         if self.accelerator.is_main_process and self.rollout_worker:
-            self.rollout_worker.reload_lora(adapter_path, lora_name)
-            self.rollout_worker.resume()
             self.model_version += 1
             self.rollout_worker.update_model_version(self.model_version)
 

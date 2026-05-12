@@ -261,8 +261,10 @@ class AsyncGRPOConfig(_BaseConfig):
         default=False,
         metadata={
             "help": "Enable LoRA mode. When True, the model is loaded as a PEFT adapter (base model auto-resolved "
-            "from adapter_config.json), only LoRA weights are trained, and weight sync saves the adapter to disk "
-            "then tells vLLM to hot-reload via /v1/load_lora_adapter instead of streaming all weights over NCCL."
+            "from adapter_config.json), only LoRA weights are trained, and weight sync sends only the LoRA A/B "
+            "tensors (~50-200MB) directly to vLLM via NCCL. The vLLM WorkerExtension calls module.set_lora() to "
+            "do in-place copy_ into pre-allocated stacked tensors — no adapter lifecycle churn, no CUDA graph "
+            "invalidation. Requires the custom LoRA NCCL server (lora_vllm_server.py) on the vLLM side."
         },
     )
     lora_adapter_path: str | None = field(

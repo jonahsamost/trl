@@ -27,6 +27,7 @@ from typing import Any, TypeAlias
 import aiohttp
 import numpy as np
 import requests
+import torch
 from accelerate.logging import get_logger
 from datasets import Dataset
 from transformers import AutoTokenizer
@@ -284,9 +285,12 @@ class AsyncRolloutWorker:
 
         self._wait_for_server_ready_sync(timeout_s=self.server_timeout)
         if self.lora_sync:
-            logger.info("LoRA sync mode: skipping NCCL weight transfer init (will use save-to-disk + HTTP reload)")
+            logger.info("LoRA sync mode: initializing direct NCCL LoRA transfer")
             self.model_update_group = None
+            self._lora_nccl_group = None
+            self._init_lora_sync_group()
         else:
+            self._lora_nccl_group = None
             self._init_weight_transfer()
 
     def _wait_for_server_ready_sync(self, timeout_s: float = 240.0, poll_interval_s: float = 2.0) -> None:
@@ -342,6 +346,89 @@ class AsyncRolloutWorker:
 
         logger.info("Init weight sync group with vLLM")
 
+    def _init_lora_sync_group(self) -> None:
+        """Initialize a dedicated NCCL group for LoRA-only weight transfer."""
+        response = requests.get(f"{self.vllm_server_url}/get_world_size")
+        inference_world_size = response.json()["world_size"]
+        world_size = inference_world_size + 1
+        master_address = get_ip()
+        master_port = get_open_port()
+
+        init_info = {
+            "init_info": {
+                "master_address": master_address,
+                "master_port": master_port,
+                "rank_offset": 1,
+                "world_size": world_size,
+            }
+        }
+        t_init = threading.Thread(
+            target=requests.post,
+            args=(f"{self.vllm_server_url}/init_lora_sync_group",),
+            kwargs={"json": init_info, "timeout": 120},
+        )
+        t_init.start()
+
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+        from src.h3_rl.train.src.rl_trl.lora_worker_extension import _create_stateless_pg
+
+        pg = _create_stateless_pg(
+            host=master_address, port=master_port, rank=0, world_size=world_size
+        )
+        self._lora_nccl_group = PyNcclCommunicator(pg, device=torch.device("cuda"))
+        t_init.join()
+        logger.info("LoRA NCCL sync group initialized (world_size=%d)", world_size)
+
+    def send_lora_weights(self, lora_param_iter, lora_alpha: float, lora_rank: int, lora_int_id: int) -> None:
+        """Send LoRA A/B tensors to vLLM via NCCL, then trigger set_lora on the server side.
+
+        Args:
+            lora_param_iter: Iterator of (peft_param_name, tensor) for LoRA params only.
+            lora_alpha: The LoRA alpha scaling factor from the adapter config.
+            lora_rank: The LoRA rank from the adapter config.
+            lora_int_id: The integer ID of the LoRA adapter in vLLM's slot table.
+        """
+        if self._lora_nccl_group is None:
+            logger.warning("LoRA NCCL group not initialized, skipping send_lora_weights")
+            return
+
+        t0 = time.time()
+
+        # Collect param metadata and tensors
+        params = []
+        tensors = []
+        for name, tensor in lora_param_iter:
+            params.append({
+                "name": name,
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype).split(".")[-1],
+            })
+            tensors.append(tensor)
+
+        manifest = json.dumps({
+            "lora_alpha": lora_alpha,
+            "lora_rank": lora_rank,
+            "lora_int_id": lora_int_id,
+            "params": params,
+        })
+
+        # POST /update_lora in a background thread (it pauses, calls collective_rpc, resumes)
+        t_update = threading.Thread(
+            target=requests.post,
+            args=(f"{self.vllm_server_url}/update_lora",),
+            kwargs={"json": {"manifest_json": manifest}, "timeout": 300},
+        )
+        t_update.start()
+
+        # Broadcast tensors to vLLM workers
+        import torch as _torch
+        for tensor in tensors:
+            self._lora_nccl_group.broadcast(tensor, src=0, stream=_torch.cuda.current_stream())
+
+        t_update.join()
+        logger.info("[weight_sync] LoRA NCCL send took %.1fs (%d params)", time.time() - t0, len(tensors))
+
     def update_model_version(self, model_version: int):
         self.model_version = model_version
 
@@ -383,16 +470,16 @@ class AsyncRolloutWorker:
             self._destroy_model_update_group()
 
     def _destroy_model_update_group(self) -> None:
-        # It's important because otherwise we get errors on exit.
-        if self.model_update_group is None:
-            return  # happens if weight transfer was never initialized
-        self.model_update_group.group.store = None
-        self.model_update_group.group.socket = None
-        self.model_update_group = None
+        if self.model_update_group is not None:
+            self.model_update_group.group.store = None
+            self.model_update_group.group.socket = None
+            self.model_update_group = None
+        if self._lora_nccl_group is not None:
+            self._lora_nccl_group = None
 
-    def pause(self) -> None:
+    def pause(self, clear_cache: bool = False) -> None:
         t0 = time.time()
-        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep"})
+        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep", "clear_cache": str(clear_cache).lower()})
         logger.debug(f"[weight_sync] pause HTTP took {time.time() - t0:.1f}s")
 
     def resume(self) -> None:
