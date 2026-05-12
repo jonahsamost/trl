@@ -1311,7 +1311,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
             C = end - start
             w_chunk = weight[start:end]  # [C, H]
 
-            torch.mm(hidden, w_chunk.t(), out=mm_buf[:, :C])
+            torch.mm(hidden, w_chunk.to(hidden.dtype).t(), out=mm_buf[:, :C])
             logits_chunk = logits_buf[:, :C]
             logits_chunk.copy_(mm_buf[:, :C])
             logits_chunk.mul_(inv_t)  # [N, C]
@@ -1329,7 +1329,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
             grad_hidden.add_(grad_logits @ w_chunk.float())
             grad_weight[start:end].add_(grad_logits.t() @ hidden.float())
 
-        return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None, None, None, None
+        return grad_hidden.to(hidden.dtype), grad_weight.to(weight.dtype), None, None, None, None, None
 
 
 def patch_chunked_lm_head(model: torch.nn.Module, chunk_size: int, temperature: float, fp32_lm_head: bool = False) -> None:

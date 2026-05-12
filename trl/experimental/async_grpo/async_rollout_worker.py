@@ -376,7 +376,7 @@ class AsyncRolloutWorker:
         pg = _create_stateless_pg(
             host=master_address, port=master_port, rank=0, world_size=world_size
         )
-        self._lora_nccl_group = PyNcclCommunicator(pg, device=torch.device("cuda"))
+        self._lora_nccl_group = PyNcclCommunicator(pg, device=torch.device(f"cuda:{torch.cuda.current_device()}"))
         t_init.join()
         logger.info("LoRA NCCL sync group initialized (world_size=%d)", world_size)
 

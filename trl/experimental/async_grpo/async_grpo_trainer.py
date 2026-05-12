@@ -599,6 +599,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
         world_size = self.accelerator.num_processes
+        global_n_tokens = completion_mask.sum()
         if self.loss_aggregation == LossAggregation.PROMPT:
             # First sum all token losses across all G completions for a prompt, then divide
             # by the total completion tokens for that prompt, then average across all prompts
