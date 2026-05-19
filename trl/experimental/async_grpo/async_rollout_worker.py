@@ -16,9 +16,11 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import queue
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -162,6 +164,37 @@ class RolloutSample:
     metrics: dict[str, float]  # logging metadata only, not used in loss computation
 
 
+class VersionTrackingQueue(queue.PriorityQueue):
+    """Priority queue that keeps rollout samples ordered by model version.
+
+    The queue reports version counts through callbacks so the rollout worker can
+    distinguish pending generation/scoring work from samples that are ready for
+    the trainer to consume.
+    """
+
+    def __init__(
+        self,
+        maxsize: int,
+        on_put: Callable[[int], None],
+        on_get: Callable[[int], None],
+    ):
+        super().__init__(maxsize=maxsize)
+        self._on_put = on_put
+        self._on_get = on_get
+        self._sequence = 0
+
+    def _put(self, item: RolloutSample) -> None:
+        sequence = self._sequence
+        self._sequence += 1
+        super()._put((item.model_version, sequence, item))
+        self._on_put(item.model_version)
+
+    def _get(self) -> RolloutSample:
+        _, _, item = super()._get()
+        self._on_get(item.model_version)
+        return item
+
+
 class AsyncRolloutWorker:
     """
     Minimal asynchronous actor worker structure.
@@ -189,6 +222,8 @@ class AsyncRolloutWorker:
         max_tool_calling_iterations: int | None = None,
         log_completions: bool = False,
         num_completions_to_print: int = 3,
+        max_staleness: int = 8,
+        samples_per_step: int = 1,
         weight_names: list[str] | None = None,
         weight_dtype_names: list[str] | None = None,
         weight_shapes: list[list[int]] | None = None,
@@ -207,14 +242,26 @@ class AsyncRolloutWorker:
         self.filter_zero_variance = filter_zero_variance
         self.no_positive_resample = no_positive_resample
         self.pass_rate_tracker: PromptPassRateTracker | None = (
-            PromptPassRateTracker(threshold=no_positive_resample_threshold, min_samples=no_positive_resample_min_samples)
+            PromptPassRateTracker(
+                threshold=no_positive_resample_threshold,
+                min_samples=no_positive_resample_min_samples,
+            )
             if no_positive_resample
             else None
         )
         self.max_tool_calling_iterations = max_tool_calling_iterations
         self.dataset = dataset
         self._dataset_iter = iter(dataset)
-        self.rollout_buffer: queue.Queue[RolloutSample] = queue.Queue(maxsize=queue_maxsize)
+        self.max_staleness = max_staleness
+        self.samples_per_step = max(samples_per_step, 1)
+        self._version_condition = threading.Condition()
+        self._live_version_counts: Counter[int] = Counter()
+        self._buffered_version_counts: Counter[int] = Counter()
+        self.rollout_buffer: queue.Queue[RolloutSample] = VersionTrackingQueue(
+            maxsize=queue_maxsize,
+            on_put=self._register_buffered_sample,
+            on_get=self._unregister_buffered_sample,
+        )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
         self._weight_update_info = {
@@ -431,6 +478,132 @@ class AsyncRolloutWorker:
 
     def update_model_version(self, model_version: int):
         self.model_version = model_version
+        with self._version_condition:
+            self._version_condition.notify_all()
+
+    @staticmethod
+    def _oldest_version(counts: Counter[int]) -> int | None:
+        return min((version for version, count in counts.items() if count > 0), default=None)
+
+    def _increment_version_count(self, counts: Counter[int], version: int, count: int) -> None:
+        if count <= 0:
+            return
+        counts[version] += count
+
+    def _decrement_version_count(self, counts: Counter[int], version: int, count: int) -> None:
+        if count <= 0:
+            return
+        counts[version] -= count
+        if counts[version] <= 0:
+            del counts[version]
+
+    def _register_pending_group(self, version: int) -> None:
+        with self._version_condition:
+            self._increment_version_count(self._live_version_counts, version, self.num_generations)
+            self._version_condition.notify_all()
+
+    def _unregister_pending_group(self, version: int) -> None:
+        with self._version_condition:
+            self._decrement_version_count(self._live_version_counts, version, self.num_generations)
+            self._version_condition.notify_all()
+
+    def _register_buffered_sample(self, version: int) -> None:
+        with self._version_condition:
+            self._increment_version_count(self._live_version_counts, version, 1)
+            self._increment_version_count(self._buffered_version_counts, version, 1)
+            self._version_condition.notify_all()
+
+    def _unregister_buffered_sample(self, version: int) -> None:
+        with self._version_condition:
+            self._decrement_version_count(self._live_version_counts, version, 1)
+            self._decrement_version_count(self._buffered_version_counts, version, 1)
+            self._version_condition.notify_all()
+
+    async def _wait_for_generation_capacity(self, stop_event: asyncio.Event) -> int | None:
+        """Wait until admitting one more prompt group cannot overfill a version window."""
+        last_log = 0.0
+        while not stop_event.is_set():
+            with self._version_condition:
+                version = self.model_version
+                live_count = self._live_version_counts.get(version, 0)
+                max_live_for_version = (self.max_staleness + 1) * self.samples_per_step
+                if self.num_generations > max_live_for_version:
+                    raise ValueError(
+                        "Staleness window is too small for one prompt group "
+                        f"(num_generations={self.num_generations}, max_live_for_version={max_live_for_version}, "
+                        f"samples_per_step={self.samples_per_step}, max_staleness={self.max_staleness})."
+                    )
+                if live_count + self.num_generations <= max_live_for_version:
+                    return version
+
+            now = time.monotonic()
+            if now - last_log > 5:
+                logger.info(
+                    "[staleness] waiting to admit rollouts for version=%d "
+                    "(live=%d, add=%d, max=%d)",
+                    version,
+                    live_count,
+                    self.num_generations,
+                    max_live_for_version,
+                )
+                last_log = now
+            await asyncio.sleep(0.1)
+        return None
+
+    def wait_until_next_sample_allowed(
+        self,
+        current_version: int,
+        max_staleness: int,
+        timeout: float,
+    ) -> None:
+        """Block the trainer when old pending rollouts need to be consumed next.
+
+        This is the consume-side half of the staleness cap. Generation admission
+        prevents creating more samples for a version than can be trained within
+        the window; this guard prevents the trainer from burning the remaining
+        window on newer samples while older rollouts are still pending.
+        """
+        deadline = time.monotonic() + timeout
+        last_log = 0.0
+        with self._version_condition:
+            while True:
+                oldest_live = self._oldest_version(self._live_version_counts)
+                if oldest_live is None:
+                    return
+
+                staleness = current_version - oldest_live
+                if staleness > max_staleness:
+                    return
+
+                live_count = self._live_version_counts[oldest_live]
+                remaining_steps = math.ceil(live_count / self.samples_per_step)
+                must_prioritize_oldest = staleness + remaining_steps - 1 >= max_staleness
+                oldest_buffered = self._oldest_version(self._buffered_version_counts)
+                if not must_prioritize_oldest or oldest_buffered == oldest_live:
+                    return
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "Timed out waiting for old rollouts to become trainable "
+                        f"(oldest_live_version={oldest_live}, current_version={current_version}, "
+                        f"staleness={staleness}, live_count={live_count}, "
+                        f"samples_per_step={self.samples_per_step}, max_staleness={max_staleness})."
+                    )
+
+                now = time.monotonic()
+                if now - last_log > 5:
+                    logger.info(
+                        "[staleness] waiting for version=%d rollouts before consuming newer samples "
+                        "(current=%d, staleness=%d, live=%d, buffered_oldest=%s)",
+                        oldest_live,
+                        current_version,
+                        staleness,
+                        live_count,
+                        oldest_buffered,
+                    )
+                    last_log = now
+                self._version_condition.wait(timeout=min(0.5, remaining))
 
     async def _run_loops(self, stop_event: asyncio.Event) -> None:
         async with aiohttp.ClientSession() as session:
@@ -449,6 +622,8 @@ class AsyncRolloutWorker:
 
     def stop(self) -> None:
         logger.info("Stopping worker thread...")
+        with self._version_condition:
+            self._version_condition.notify_all()
         if self._loop and self._loop.is_running():
             try:
                 self._loop.call_soon_threadsafe(self._stop_event.set)
@@ -535,6 +710,9 @@ class AsyncRolloutWorker:
                 while free_slots and not stop_event.is_set():
                     group_id, row = next(work_iter)
                     if group_id not in pending_groups:
+                        model_version = await self._wait_for_generation_capacity(stop_event)
+                        if model_version is None:
+                            return
                         prompt = row["prompt"]
                         prompt_ids = self.tokenizer.apply_chat_template(
                             prompt,
@@ -559,10 +737,11 @@ class AsyncRolloutWorker:
                             tool_mask=[],
                             tool_call_counts=[],
                             tool_failure_counts=[],
-                            model_version=self.model_version,
+                            model_version=model_version,
                             prompt_group_id=group_id,
                             prompt_hash=_hash_prompt(prompt),
                         )
+                        self._register_pending_group(model_version)
                         pending_completed[group_id] = 0
                         logger.debug(f"Started group {group_id}; pending_groups={len(pending_groups)}")
 
@@ -636,6 +815,8 @@ class AsyncRolloutWorker:
                 task.cancel()
             if inflight_tasks:
                 await asyncio.gather(*inflight_tasks, return_exceptions=True)
+            for group in pending_groups.values():
+                self._unregister_pending_group(group.model_version)
             # Use put_nowait: if the queue is full at shutdown, skip the sentinel —
             # _score_loop will exit via stop_event check in its outer loop.
             try:
@@ -679,44 +860,47 @@ class AsyncRolloutWorker:
             if score_queue_wait > 0.5:
                 logger.info(f"[score] waited {score_queue_wait:.1f}s for a group to score")
 
-            t0 = time.monotonic()
-            samples = await self._score_group(group)
-            scoring_time = time.monotonic() - t0
-            logger.info(
-                f"[score] scored {len(samples)} samples in {scoring_time:.2f}s, "
-                f"buffer_qsize={self.rollout_buffer.qsize()}"
-            )
-
-            self._compute_rollout_metrics(samples, scoring_time, wait_scoring)
-
-            if self.log_completions and samples:
-                print_prompt_completions_sample(
-                    prompts=[s.prompt for s in samples],
-                    completions=[s.completion for s in samples],
-                    rewards={"reward": [s.metrics["reward"] for s in samples]},
-                    advantages=[s.advantage for s in samples],
-                    step=self._total_groups_scored,
-                    num_samples=self.num_completions_to_print,
+            try:
+                t0 = time.monotonic()
+                samples = await self._score_group(group)
+                scoring_time = time.monotonic() - t0
+                logger.info(
+                    f"[score] scored {len(samples)} samples in {scoring_time:.2f}s, "
+                    f"buffer_qsize={self.rollout_buffer.qsize()}"
                 )
-            self._total_groups_scored += 1
 
-            for sample in samples:
-                while True:
-                    try:
-                        self.rollout_buffer.put_nowait(sample)
-                        break
-                    except queue.Full:
-                        if stop_event.is_set():
-                            return
-                        # Wait for trainer to consume loop
-                        logger.info(
-                            f"[score] rollout buffer full (maxsize={self.rollout_buffer.maxsize}), waiting for trainer to consume..."
-                        )
-                        await asyncio.sleep(0.1)
+                self._compute_rollout_metrics(samples, scoring_time, wait_scoring)
 
-            logger.debug(
-                f"Scored group with {len(samples)} samples; rollout_buffer_qsize={self.rollout_buffer.qsize()}"
-            )
+                if self.log_completions and samples:
+                    print_prompt_completions_sample(
+                        prompts=[s.prompt for s in samples],
+                        completions=[s.completion for s in samples],
+                        rewards={"reward": [s.metrics["reward"] for s in samples]},
+                        advantages=[s.advantage for s in samples],
+                        step=self._total_groups_scored,
+                        num_samples=self.num_completions_to_print,
+                    )
+                self._total_groups_scored += 1
+
+                for sample in samples:
+                    while True:
+                        try:
+                            self.rollout_buffer.put_nowait(sample)
+                            break
+                        except queue.Full:
+                            if stop_event.is_set():
+                                return
+                            # Wait for trainer to consume loop
+                            logger.info(
+                                f"[score] rollout buffer full (maxsize={self.rollout_buffer.maxsize}), waiting for trainer to consume..."
+                            )
+                            await asyncio.sleep(0.1)
+
+                logger.debug(
+                    f"Scored group with {len(samples)} samples; rollout_buffer_qsize={self.rollout_buffer.qsize()}"
+                )
+            finally:
+                self._unregister_pending_group(group.model_version)
 
     def _repeat_iterator(self) -> Iterator[tuple[int, dict[str, Any]]]:
         group_id = 0

@@ -62,9 +62,21 @@ class RolloutWorkerProtocol(Protocol):
     def pause(self, clear_cache: bool = False) -> None: ...
     def resume(self) -> None: ...
     def send_weights(self, iterator: Iterator[tuple[str, torch.Tensor]]) -> None: ...
-    def send_lora_weights(self, lora_param_iter: Iterator[tuple[str, torch.Tensor]], lora_alpha: float, lora_rank: int, lora_int_id: int) -> None: ...
+    def send_lora_weights(
+        self,
+        lora_param_iter: Iterator[tuple[str, torch.Tensor]],
+        lora_alpha: float,
+        lora_rank: int,
+        lora_int_id: int,
+    ) -> None: ...
     def reload_lora(self, adapter_path: str, lora_name: str) -> None: ...
     def update_model_version(self, version: int) -> None: ...
+    def wait_until_next_sample_allowed(
+        self,
+        current_version: int,
+        max_staleness: int,
+        timeout: float,
+    ) -> None: ...
 
 
 class StepIntervalCallback(TrainerCallback):
@@ -82,28 +94,42 @@ class StepIntervalCallback(TrainerCallback):
 
 
 class RolloutQueueDataset(torch.utils.data.IterableDataset):
-    def __init__(self, rollout_queue, model_version_fn, max_staleness=3, timeout=120.0, full_batch_size=None):
+    def __init__(
+        self,
+        rollout_queue,
+        model_version_fn,
+        max_staleness=3,
+        timeout=120.0,
+        full_batch_size=None,
+        staleness_guard_fn=None,
+    ):
         self.queue = rollout_queue
         self.model_version_fn = model_version_fn
         self.max_staleness = max_staleness
         self.timeout = timeout
         self.full_batch_size = full_batch_size
+        self.staleness_guard_fn = staleness_guard_fn
 
-    def _pull_non_stale(self):
-        """Pull the next non-stale sample from the queue, or None on timeout."""
-        while True:
-            t0 = time.time()
-            try:
-                sample = self.queue.get(timeout=self.timeout)
-            except queue.Empty:
-                return None, 0.0, 0
-            wait_s = time.time() - t0
+    def _pull_next_sample(self):
+        """Pull the next trainable sample from the queue, or None on timeout."""
+        if self.staleness_guard_fn is not None:
+            self.staleness_guard_fn()
 
-            staleness = self.model_version_fn() - sample.model_version
-            if staleness > self.max_staleness:
-                logger.info(f"dropping stale sample (staleness={staleness}, max={self.max_staleness})")
-                continue
-            return sample, wait_s, staleness
+        t0 = time.time()
+        try:
+            sample = self.queue.get(timeout=self.timeout)
+        except queue.Empty:
+            return None, 0.0, 0
+        wait_s = time.time() - t0
+
+        staleness = self.model_version_fn() - sample.model_version
+        if staleness > self.max_staleness:
+            raise RuntimeError(
+                "Backpressure invariant failed: rollout sample exceeded max_staleness "
+                f"(staleness={staleness}, max={self.max_staleness}, "
+                f"sample_version={sample.model_version}, current_version={self.model_version_fn()})."
+            )
+        return sample, wait_s, staleness
 
     def _sample_to_dict(self, sample, queue_wait_time_s, batch_adv_std, staleness):
         return {
@@ -126,7 +152,7 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
                 while len(buffer) < self.full_batch_size:
                     if not buffer and self.queue.qsize() == 0:
                         logger.info("queue empty, waiting for rollout samples...")
-                    sample, wait_s, staleness = self._pull_non_stale()
+                    sample, wait_s, staleness = self._pull_next_sample()
                     if sample is None:
                         logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
                         if buffer:
@@ -150,7 +176,7 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
             else:
                 if self.queue.qsize() == 0:
                     logger.info("queue empty, waiting for rollout samples...")
-                sample, wait_s, staleness = self._pull_non_stale()
+                sample, wait_s, staleness = self._pull_next_sample()
                 if sample is None:
                     logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
                     return
@@ -473,6 +499,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     max_tool_calling_iterations=self.args.max_tool_calling_iterations,
                     log_completions=self.args.log_completions,
                     num_completions_to_print=self.args.num_completions_to_print,
+                    max_staleness=self.args.max_staleness,
+                    samples_per_step=samples_per_step,
                     weight_names=weight_names,
                     weight_dtype_names=weight_dtype_names,
                     weight_shapes=weight_shapes,
@@ -498,12 +526,27 @@ class AsyncGRPOTrainer(_BaseTrainer):
             * self.accelerator.num_processes
         )
         if self.accelerator.is_main_process:
+            staleness_guard_fn = (
+                lambda: self.rollout_worker.wait_until_next_sample_allowed(
+                    current_version=self.model_version,
+                    max_staleness=self.args.max_staleness,
+                    timeout=self.args.vllm_server_timeout,
+                )
+                if self.rollout_worker is not None
+                and hasattr(self.rollout_worker, "wait_until_next_sample_allowed")
+                else None
+            )
             dataset = RolloutQueueDataset(
                 rollout_queue=self.rollout_queue,
                 model_version_fn=lambda: self.model_version,
                 max_staleness=self.args.max_staleness,
                 timeout=self.args.vllm_server_timeout,
-                full_batch_size=full_batch_size if self.advantage_normalization == AdvantageNormalization.BATCH else None,
+                full_batch_size=(
+                    full_batch_size
+                    if self.advantage_normalization == AdvantageNormalization.BATCH
+                    else None
+                ),
+                staleness_guard_fn=staleness_guard_fn,
             )
         else:
             dataset = _EmptyIterableDataset()

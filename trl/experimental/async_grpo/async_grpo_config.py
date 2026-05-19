@@ -102,8 +102,8 @@ class AsyncGRPOConfig(_BaseConfig):
             If using tool-use environments, you may want to set this manually based on how many parallel environments
             you can run.
         max_staleness (`int`, *optional*, defaults to `4`):
-            Maximum number of weight update steps a rollout sample can lag behind the current model version before
-            being discarded.
+            Maximum number of weight update steps a rollout sample can lag behind the current model version.
+            Generation and trainer consumption apply backpressure to keep samples within this window.
         queue_maxsize (`int`, *optional*, defaults to `1024`):
             Maximum number of rollout samples to buffer in the rollout queue.
         weight_sync_steps (`int`, *optional*, defaults to `1`):
@@ -235,8 +235,9 @@ class AsyncGRPOConfig(_BaseConfig):
         metadata={
             "help": "Maximum number of concurrent generation tasks sent to the vLLM server. Defaults to -1 (auto), "
             "which sets it to `max_staleness * per_device_train_batch_size * gradient_accumulation_steps * "
-            "num_processes`. Generating more samples than this is wasteful since they will be discarded as stale "
-            "before the trainer can consume them. If using tool-use environments, you may want to set this manually "
+            "num_processes`. Generating more samples than this is wasteful because staleness backpressure will "
+            "stop admitting new rollouts until the trainer catches up. If using tool-use environments, you may "
+            "want to set this manually "
             "based on how many parallel environments you can run."
         },
     )
@@ -244,7 +245,7 @@ class AsyncGRPOConfig(_BaseConfig):
         default=8,
         metadata={
             "help": "Maximum number of weight update steps a rollout sample can lag behind the current model version "
-            "before being discarded."
+            "before generation/training backpressure is applied."
         },
     )
     queue_maxsize: int = field(
