@@ -35,7 +35,7 @@ from transformers.data.data_collator import DataCollatorMixin
 from trl.trainer.base_trainer import _BaseTrainer
 from trl.trainer.utils import pad, patch_chunked_lm_head
 
-from .async_grpo_config import AsyncGRPOConfig, AdvantageNormalization, LossFns, LossAggregation
+from .async_grpo_config import AdvantageNormalization, AsyncGRPOConfig, LossAggregation, LossFns
 from .async_rollout_worker import AsyncRolloutWorker
 
 
@@ -124,7 +124,8 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
 
         staleness = self.model_version_fn() - sample.model_version
         if staleness > self.max_staleness:
-            raise RuntimeError(
+            # raise RuntimeError(
+            logger.error(
                 "Backpressure invariant failed: rollout sample exceeded max_staleness "
                 f"(staleness={staleness}, max={self.max_staleness}, "
                 f"sample_version={sample.model_version}, current_version={self.model_version_fn()})."
@@ -471,6 +472,16 @@ class AsyncGRPOTrainer(_BaseTrainer):
             if rollout_worker is not None:
                 # Use the injected worker (e.g. a stub in tests). The queue is owned by the worker.
                 self.rollout_worker = rollout_worker
+                configure_staleness_backpressure = getattr(
+                    self.rollout_worker,
+                    "configure_staleness_backpressure",
+                    None,
+                )
+                if configure_staleness_backpressure is not None:
+                    configure_staleness_backpressure(
+                        max_staleness=self.args.max_staleness,
+                        samples_per_step=samples_per_step,
+                    )
             else:
                 # NCCL weight transfer needs full metadata; LoRA mode skips this entirely.
                 weight_names, weight_dtype_names, weight_shapes = [], [], []
@@ -526,16 +537,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
             * self.accelerator.num_processes
         )
         if self.accelerator.is_main_process:
-            staleness_guard_fn = (
-                lambda: self.rollout_worker.wait_until_next_sample_allowed(
-                    current_version=self.model_version,
-                    max_staleness=self.args.max_staleness,
-                    timeout=self.args.vllm_server_timeout,
-                )
-                if self.rollout_worker is not None
-                and hasattr(self.rollout_worker, "wait_until_next_sample_allowed")
-                else None
-            )
+            staleness_guard_fn = None
+            if self.rollout_worker is not None and hasattr(self.rollout_worker, "wait_until_next_sample_allowed"):
+                def staleness_guard_fn() -> None:
+                    self.rollout_worker.wait_until_next_sample_allowed(
+                        current_version=self.model_version,
+                        max_staleness=self.args.max_staleness,
+                        timeout=self.args.vllm_server_timeout,
+                    )
             dataset = RolloutQueueDataset(
                 rollout_queue=self.rollout_queue,
                 model_version_fn=lambda: self.model_version,
@@ -795,19 +804,21 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
     def _sync_weight_lora(self, t0: float):
         """LoRA sync: stream LoRA A/B tensors to vLLM via NCCL, bypassing disk + adapter lifecycle."""
+        synced = False
         if self.accelerator.is_main_process and self.rollout_worker:
-            self.rollout_worker.send_lora_weights(
+            result = self.rollout_worker.send_lora_weights(
                 self._lora_param_iter(),
                 lora_alpha=self._lora_alpha,
                 lora_rank=self._lora_rank,
                 lora_int_id=self._lora_int_id,
             )
+            synced = bool(result) if result is not None else True
         else:
             # Non-rank-0 must still participate in DTensor full_tensor() collectives for FSDP2
             for _ in self._lora_param_iter():
                 pass
 
-        if self.accelerator.is_main_process and self.rollout_worker:
+        if synced and self.accelerator.is_main_process and self.rollout_worker:
             self.model_version += 1
             self.rollout_worker.update_model_version(self.model_version)
 

@@ -527,25 +527,43 @@ class AsyncRolloutWorker:
                 version = self.model_version
                 live_count = self._live_version_counts.get(version, 0)
                 max_live_for_version = (self.max_staleness + 1) * self.samples_per_step
+                oldest_live = self._oldest_version(self._live_version_counts)
+                oldest_staleness = version - oldest_live if oldest_live is not None else None
                 if self.num_generations > max_live_for_version:
                     raise ValueError(
                         "Staleness window is too small for one prompt group "
                         f"(num_generations={self.num_generations}, max_live_for_version={max_live_for_version}, "
                         f"samples_per_step={self.samples_per_step}, max_staleness={self.max_staleness})."
                     )
-                if live_count + self.num_generations <= max_live_for_version:
+                if oldest_staleness is None and live_count + self.num_generations <= max_live_for_version:
+                    return version
+                if (
+                    oldest_staleness is not None
+                    and oldest_staleness < self.max_staleness
+                    and live_count + self.num_generations <= max_live_for_version
+                ):
                     return version
 
             now = time.monotonic()
             if now - last_log > 5:
-                logger.info(
-                    "[staleness] waiting to admit rollouts for version=%d "
-                    "(live=%d, add=%d, max=%d)",
-                    version,
-                    live_count,
-                    self.num_generations,
-                    max_live_for_version,
-                )
+                if oldest_staleness is not None and oldest_staleness >= self.max_staleness:
+                    logger.info(
+                        "[staleness] waiting to admit rollouts for version=%d because oldest live "
+                        "version=%d is at staleness=%d (max=%d)",
+                        version,
+                        oldest_live,
+                        oldest_staleness,
+                        self.max_staleness,
+                    )
+                else:
+                    logger.info(
+                        "[staleness] waiting to admit rollouts for version=%d "
+                        "(live=%d, add=%d, max=%d)",
+                        version,
+                        live_count,
+                        self.num_generations,
+                        max_live_for_version,
+                    )
                 last_log = now
             await asyncio.sleep(0.1)
         return None
