@@ -375,6 +375,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self.fp32_lm_head = self.args.fp32_lm_head
         self.loss_aggregation = LossAggregation(self.args.loss_aggregation)
         self.advantage_normalization = AdvantageNormalization(self.args.advantage_normalization)
+        self.echo_lambda = self.args.echo_lambda
 
         # Model
         model_name = model
@@ -680,6 +681,21 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         loss = loss / self.current_gradient_accumulation_steps
 
+        # ECHO: auxiliary cross-entropy on environment-observation tokens.
+        # Derives the env mask from completion_mask (assistant=1) and attention_mask (non-pad=1).
+        # The prompt region is all-zeros in completion_mask; we find its end via argmax.
+        if self.echo_lambda > 0:
+            first_completion = completion_mask.argmax(dim=1, keepdim=True)
+            positions = torch.arange(completion_mask.shape[1], device=completion_mask.device).unsqueeze(0)
+            in_completion_region = (positions >= first_completion).float()
+            env_mask = in_completion_region * (1 - completion_mask) * attention_mask[:, 1:]
+
+            env_ce = -log_probs * env_mask
+            env_tokens_per_seq = env_mask.sum(dim=1).clamp(min=1)
+            per_seq_env_loss = env_ce.sum(dim=1) / env_tokens_per_seq
+            echo_loss = per_seq_env_loss.mean()
+            loss = loss + self.echo_lambda * echo_loss / self.current_gradient_accumulation_steps
+
         with torch.no_grad():
             valid_mask = completion_mask > 0
             local_count = valid_mask.sum().float()
@@ -744,6 +760,19 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self._metrics["train"]["forward_time_s"].append(self._last_forward_time_s)
             # NOTE: in dynamic mbs setup, we would need to agg across DP ranks.
             self._metrics["train"]["train_seq_len"].append(float(local_max_len))
+
+            if self.echo_lambda > 0:
+                local_env_ce = (-log_probs * env_mask).sum()
+                local_env_count = env_mask.sum()
+                env_stats = torch.stack([local_env_ce, local_env_count])
+                env_stats = self.accelerator.reduce(env_stats, reduction="sum")
+                global_env_ce, global_env_count = env_stats.unbind(0)
+                self._metrics["train"]["echo/env_ce_per_token"].append(
+                    (global_env_ce / global_env_count.clamp(min=1)).item()
+                )
+                self._metrics["train"]["echo/env_token_frac"].append(
+                    (global_env_count / (global_n_tokens + global_env_count).clamp(min=1)).item()
+                )
         return loss
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:

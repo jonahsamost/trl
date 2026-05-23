@@ -228,6 +228,13 @@ class AsyncGRPOConfig(_BaseConfig):
         default=16,
         metadata={"help": "Minimum number of binary outcomes observed before a prompt can be retired."},
     )
+    echo_lambda: float = field(
+        default=0.0,
+        metadata={
+            "help": "ECHO environment-prediction loss weight (Shrivastava et al., 2026). "
+            "0.0 disables ECHO (pure GRPO). Recommended: 0.05 for base models, 0.02 for SFT-initialized."
+        },
+    )
 
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(
