@@ -448,6 +448,17 @@ class AsyncGRPOTrainer(_BaseTrainer):
             * self.args.gradient_accumulation_steps
             * self.accelerator.num_processes
         )
+        if samples_per_step < self.args.num_generations:
+            raise ValueError(
+                "Unsafe async rollout cadence: one prompt group produces "
+                f"num_generations={self.args.num_generations} samples, but the trainer only "
+                f"consumes samples_per_step={samples_per_step} samples per optimizer step "
+                f"(per_device_train_batch_size={self.args.per_device_train_batch_size}, "
+                f"gradient_accumulation_steps={self.args.gradient_accumulation_steps}, "
+                f"num_processes={self.accelerator.num_processes}). Increase the trainer batch "
+                "or gradient accumulation, or reduce num_generations, so samples_per_step >= "
+                "num_generations."
+            )
         if self.args.max_steps <= 0 and train_dataset is not None and hasattr(train_dataset, "__len__"):
             samples_per_epoch = len(train_dataset) * self.args.num_generations
             self.args.max_steps = int(self.args.num_train_epochs * samples_per_epoch / samples_per_step)
@@ -598,6 +609,22 @@ class AsyncGRPOTrainer(_BaseTrainer):
         completion_mask = inputs["completion_mask"]
         old_log_probs = inputs["old_log_probs"]
         advantages = inputs["advantages"]
+
+        if self.args.max_train_seq_len > 0:
+            cap = self.args.max_train_seq_len
+            for row in range(input_ids.size(0)):
+                seq_len = int(attention_mask[row].sum().item())
+                if seq_len <= cap:
+                    continue
+                start = seq_len - cap
+                input_ids[row, :cap] = input_ids[row, start:seq_len]
+                attention_mask[row, :cap] = attention_mask[row, start:seq_len]
+                completion_mask[row, :cap] = completion_mask[row, start:seq_len]
+                old_log_probs[row, :cap] = old_log_probs[row, start:seq_len]
+                input_ids[row, cap:] = self.processing_class.pad_token_id
+                attention_mask[row, cap:] = 0
+                completion_mask[row, cap:] = 0
+                old_log_probs[row, cap:] = 0
 
         # The collator pads to the global batch max length (across all ranks). After DataLoaderDispatcher slices and
         # sends rows to each rank, the local slice is still padded to that global max. Truncate to the longest real

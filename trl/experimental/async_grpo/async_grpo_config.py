@@ -146,6 +146,13 @@ class AsyncGRPOConfig(_BaseConfig):
         default=2048,
         metadata={"help": "Maximum number of tokens to generate per completion."},
     )
+    max_train_seq_len: int = field(
+        default=0,
+        metadata={
+            "help": "Hard cap on total training sequence length (prompt + completion). "
+            "Left-truncates to keep the most recent tokens. 0 disables trainer-side truncation."
+        },
+    )
     temperature: float = field(
         default=1.0,
         metadata={"help": "Temperature for sampling. The higher the temperature, the more random the completions."},

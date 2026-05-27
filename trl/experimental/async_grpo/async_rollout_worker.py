@@ -326,6 +326,10 @@ class AsyncRolloutWorker:
         self._groups_to_score: asyncio.Queue[RolloutGroup | None] = asyncio.Queue(maxsize=16)
         self._total_completion_tokens = 0
         self._total_groups_scored = 0
+        self._group_metrics_lock = threading.Lock()
+        self._groups_seen_total = 0
+        self._groups_trainable_total = 0
+        self._groups_zero_variance_dropped_total = 0
         self._generation_start_time: float | None = None
         self.model_version = 0
         self.session = None
@@ -339,6 +343,30 @@ class AsyncRolloutWorker:
         else:
             self._lora_nccl_group = None
             self._init_weight_transfer()
+
+    def _record_group_outcome(self, outcome: str) -> None:
+        """Track group-level outcomes that may not produce trainable samples."""
+        with self._group_metrics_lock:
+            self._groups_seen_total += 1
+            if outcome == "trainable":
+                self._groups_trainable_total += 1
+            elif outcome == "zero_variance":
+                self._groups_zero_variance_dropped_total += 1
+            else:
+                raise ValueError(f"Unknown group outcome: {outcome}")
+
+    def _group_metrics_snapshot(self) -> dict[str, float]:
+        """Return cumulative group outcome counters for W&B logging."""
+        with self._group_metrics_lock:
+            groups_seen = max(self._groups_seen_total, 1)
+            return {
+                "groups_seen_total": float(self._groups_seen_total),
+                "groups_trainable_total": float(self._groups_trainable_total),
+                "groups_dropped_total": float(self._groups_zero_variance_dropped_total),
+                "groups_zero_variance_dropped_total": float(self._groups_zero_variance_dropped_total),
+                "groups_zero_variance_drop_rate": self._groups_zero_variance_dropped_total / groups_seen,
+                "groups_drop_rate": self._groups_zero_variance_dropped_total / groups_seen,
+            }
 
     def _wait_for_server_ready_sync(self, timeout_s: float = 240.0, poll_interval_s: float = 2.0) -> None:
         """Block until the vLLM server is healthy."""
@@ -1103,14 +1131,21 @@ class AsyncRolloutWorker:
             self.pass_rate_tracker.update(group.prompt_hash, rewards.tolist())
 
         if self.filter_zero_variance and reward_std < 1e-8:
+            self._record_group_outcome("zero_variance")
             logger.info(
                 f"Dropping zero-variance group (prompt_group_id={group.prompt_group_id}, "
-                f"reward={rewards[0]:.4f}, n={len(rewards)})"
+                f"reward={rewards[0]:.4f}, n={len(rewards)}, group_metrics={self._group_metrics_snapshot()})"
             )
             return []
 
+        self._record_group_outcome("trainable")
         advantages = rewards - reward_mean
-        logger.info(f"Rollout metrics: reward_mean={reward_mean:.4f}, reward_std={reward_std:.4f}")
+        logger.info(
+            "Rollout metrics: reward_mean=%.4f, reward_std=%.4f, group_metrics=%s",
+            reward_mean,
+            reward_std,
+            self._group_metrics_snapshot(),
+        )
 
         # tools/call_frequency: mean calls per completion (matches TRL's total_calls / num_completions)
         # tools/failure_frequency: per-completion failure rate; averaged across samples in compute_loss
@@ -1135,6 +1170,7 @@ class AsyncRolloutWorker:
         if self.pass_rate_tracker is not None:
             tracker_metrics["prompts_retired"] = float(self.pass_rate_tracker.num_retired)
             tracker_metrics["prompts_tracked"] = float(self.pass_rate_tracker.num_tracked)
+        tracker_metrics.update(self._group_metrics_snapshot())
 
         return [
             RolloutSample(
