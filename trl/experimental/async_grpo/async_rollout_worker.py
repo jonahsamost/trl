@@ -238,6 +238,7 @@ class AsyncRolloutWorker:
         num_completions_to_print: int = 3,
         max_staleness: int = 8,
         samples_per_step: int = 1,
+        rollout_group_timeout: float | None = None,
         weight_names: list[str] | None = None,
         weight_dtype_names: list[str] | None = None,
         weight_shapes: list[list[int]] | None = None,
@@ -269,9 +270,11 @@ class AsyncRolloutWorker:
         self._dataset_iter = iter(dataset)
         self.max_staleness = max_staleness
         self.samples_per_step = max(samples_per_step, 1)
+        self.rollout_group_timeout = rollout_group_timeout
         self._version_condition = threading.Condition()
         self._live_version_counts: Counter[int] = Counter()
         self._buffered_version_counts: Counter[int] = Counter()
+        self._last_capacity_log = 0.0
         self.rollout_buffer: queue.Queue[RolloutSample] = VersionTrackingQueue(
             maxsize=queue_maxsize,
             on_put=self._register_buffered_sample,
@@ -574,54 +577,101 @@ class AsyncRolloutWorker:
             self._decrement_version_count(self._buffered_version_counts, version, 1)
             self._version_condition.notify_all()
 
-    async def _wait_for_generation_capacity(self, stop_event: asyncio.Event) -> int | None:
-        """Wait until admitting one more prompt group cannot overfill a version window."""
-        last_log = 0.0
-        while not stop_event.is_set():
-            with self._version_condition:
-                version = self.model_version
-                live_count = self._live_version_counts.get(version, 0)
-                max_live_for_version = (self.max_staleness + 1) * self.samples_per_step
-                oldest_live = self._oldest_version(self._live_version_counts)
-                oldest_staleness = version - oldest_live if oldest_live is not None else None
-                if self.num_generations > max_live_for_version:
-                    raise ValueError(
-                        "Staleness window is too small for one prompt group "
-                        f"(num_generations={self.num_generations}, max_live_for_version={max_live_for_version}, "
-                        f"samples_per_step={self.samples_per_step}, max_staleness={self.max_staleness})."
-                    )
-                if oldest_staleness is None and live_count + self.num_generations <= max_live_for_version:
-                    return version
-                if (
-                    oldest_staleness is not None
-                    and oldest_staleness < self.max_staleness
-                    and live_count + self.num_generations <= max_live_for_version
-                ):
-                    return version
+    def _get_admissible_generation_version(self) -> int | None:
+        """Return a version that can admit one group, or ``None`` if capacity is full."""
+        with self._version_condition:
+            version = self.model_version
+            live_count = self._live_version_counts.get(version, 0)
+            max_live_for_version = (self.max_staleness + 1) * self.samples_per_step
+            oldest_live = self._oldest_version(self._live_version_counts)
+            oldest_staleness = version - oldest_live if oldest_live is not None else None
+            if self.num_generations > max_live_for_version:
+                raise ValueError(
+                    "Staleness window is too small for one prompt group "
+                    f"(num_generations={self.num_generations}, max_live_for_version={max_live_for_version}, "
+                    f"samples_per_step={self.samples_per_step}, max_staleness={self.max_staleness})."
+                )
+            if oldest_staleness is None and live_count + self.num_generations <= max_live_for_version:
+                return version
+            if (
+                oldest_staleness is not None
+                and oldest_staleness < self.max_staleness
+                and live_count + self.num_generations <= max_live_for_version
+            ):
+                return version
 
-            now = time.monotonic()
-            if now - last_log > 5:
-                if oldest_staleness is not None and oldest_staleness >= self.max_staleness:
-                    logger.info(
-                        "[staleness] waiting to admit rollouts for version=%d because oldest live "
-                        "version=%d is at staleness=%d (max=%d)",
-                        version,
-                        oldest_live,
-                        oldest_staleness,
-                        self.max_staleness,
-                    )
-                else:
-                    logger.info(
-                        "[staleness] waiting to admit rollouts for version=%d "
-                        "(live=%d, add=%d, max=%d)",
-                        version,
-                        live_count,
-                        self.num_generations,
-                        max_live_for_version,
-                    )
-                last_log = now
-            await asyncio.sleep(0.1)
+        now = time.monotonic()
+        if now - self._last_capacity_log > 5:
+            if oldest_staleness is not None and oldest_staleness >= self.max_staleness:
+                logger.info(
+                    "[staleness] waiting to admit rollouts for version=%d because oldest live "
+                    "version=%d is at staleness=%d (max=%d)",
+                    version,
+                    oldest_live,
+                    oldest_staleness,
+                    self.max_staleness,
+                )
+            else:
+                logger.info(
+                    "[staleness] waiting to admit rollouts for version=%d "
+                    "(live=%d, add=%d, max=%d)",
+                    version,
+                    live_count,
+                    self.num_generations,
+                    max_live_for_version,
+                )
+            self._last_capacity_log = now
         return None
+
+    def _expire_timed_out_pending_groups(
+        self,
+        pending_groups: dict[int, RolloutGroup],
+        pending_completed: dict[int, int],
+        pending_started_at: dict[int, float],
+        inflight_tasks: dict[asyncio.Task, tuple[int, int]],
+        free_slots: set[int],
+        abandoned_group_ids: set[int],
+    ) -> list[asyncio.Task]:
+        """Abandon pending groups that exceeded the configured group timeout."""
+        if self.rollout_group_timeout is None:
+            return []
+
+        now = time.monotonic()
+        expired_group_ids = [
+            group_id
+            for group_id, started_at in pending_started_at.items()
+            if now - started_at > self.rollout_group_timeout
+        ]
+        cancelled_tasks = []
+        for group_id in expired_group_ids:
+            group = pending_groups.pop(group_id, None)
+            if group is None:
+                pending_completed.pop(group_id, None)
+                pending_started_at.pop(group_id, None)
+                continue
+
+            completed = pending_completed.pop(group_id, 0)
+            started_at = pending_started_at.pop(group_id)
+            abandoned_group_ids.add(group_id)
+            for task, (task_group_id, slot) in list(inflight_tasks.items()):
+                if task_group_id != group_id:
+                    continue
+                del inflight_tasks[task]
+                free_slots.add(slot)
+                task.cancel()
+                cancelled_tasks.append(task)
+
+            self._unregister_pending_group(group.model_version)
+            logger.warning(
+                "[timeout] abandoning rollout group=%d version=%d completed=%d/%d age=%.1fs timeout=%.1fs",
+                group_id,
+                group.model_version,
+                completed,
+                self.num_generations,
+                now - started_at,
+                self.rollout_group_timeout,
+            )
+        return cancelled_tasks
 
     def wait_until_next_sample_allowed(
         self,
@@ -778,21 +828,41 @@ class AsyncRolloutWorker:
     async def _generate_loop(self, stop_event: asyncio.Event) -> None:
         pending_groups: dict[int, RolloutGroup] = {}
         pending_completed: dict[int, int] = {}
+        pending_started_at: dict[int, float] = {}
         inflight_tasks: dict[asyncio.Task, tuple[int, int]] = {}
+        abandoned_group_ids: set[int] = set()
         free_slots = set(range(self.max_inflight_tasks))
         work_iter = self._repeat_iterator()
+        pending_work: tuple[int, dict[str, Any]] | None = None
         total_completions_finished = 0
         _server_rr_counter = 0
 
         self._generation_start_time = time.monotonic()
         try:
             while True:
+                cancelled_tasks = self._expire_timed_out_pending_groups(
+                    pending_groups=pending_groups,
+                    pending_completed=pending_completed,
+                    pending_started_at=pending_started_at,
+                    inflight_tasks=inflight_tasks,
+                    free_slots=free_slots,
+                    abandoned_group_ids=abandoned_group_ids,
+                )
+                if cancelled_tasks:
+                    await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+
                 while free_slots and not stop_event.is_set():
-                    group_id, row = next(work_iter)
+                    if pending_work is None:
+                        pending_work = next(work_iter)
+                    group_id, row = pending_work
+                    if group_id in abandoned_group_ids:
+                        pending_work = None
+                        continue
+
                     if group_id not in pending_groups:
-                        model_version = await self._wait_for_generation_capacity(stop_event)
+                        model_version = self._get_admissible_generation_version()
                         if model_version is None:
-                            return
+                            break
                         prompt = row["prompt"]
                         prompt_ids = self.tokenizer.apply_chat_template(
                             prompt,
@@ -823,6 +893,7 @@ class AsyncRolloutWorker:
                         )
                         self._register_pending_group(model_version)
                         pending_completed[group_id] = 0
+                        pending_started_at[group_id] = time.monotonic()
                         logger.debug(f"Started group {group_id}; pending_groups={len(pending_groups)}")
 
                     slot = free_slots.pop()
@@ -837,6 +908,7 @@ class AsyncRolloutWorker:
                         self._generate_one(pending_groups[group_id].prompt, tool_dict=self._sync_tool_dicts[slot], server_url=server_url)
                     )
                     inflight_tasks[task] = (group_id, slot)
+                    pending_work = None
 
                 if not inflight_tasks:
                     if stop_event.is_set():
@@ -909,6 +981,7 @@ class AsyncRolloutWorker:
                         logger.info(f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}")
                         del pending_groups[group_id]
                         del pending_completed[group_id]
+                        del pending_started_at[group_id]
         finally:
             for task in inflight_tasks:
                 task.cancel()

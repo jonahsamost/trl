@@ -193,6 +193,13 @@ class AsyncGRPOConfig(_BaseConfig):
         default=600,
         metadata={"help": "Timeout in seconds for individual HTTP requests to the vLLM server."},
     )
+    rollout_group_timeout: float | None = field(
+        default=None,
+        metadata={
+            "help": "Optional timeout in seconds for one logical rollout group. When set, a pending group that does "
+            "not become trainable before this timeout is abandoned and its staleness accounting is cleaned up."
+        },
+    )
 
     # Parameters that control the training
     epsilon: float = field(
@@ -328,6 +335,9 @@ class AsyncGRPOConfig(_BaseConfig):
 
         if self.advantage_normalization not in AdvantageNormalization.values():
             raise ValueError(f"Advantage normalization not supported. Supported options are: {AdvantageNormalization.values()}")
+
+        if self.rollout_group_timeout is not None and self.rollout_group_timeout <= 0:
+            raise ValueError("rollout_group_timeout must be positive when set")
 
         if not self.vllm_server_urls:
             raise ValueError("vllm_server_urls must contain at least one URL")

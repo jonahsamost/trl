@@ -348,6 +348,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
                         max_staleness=self.args.max_staleness,
                         samples_per_step=samples_per_step,
                     )
+                configure_rollout_group_timeout = getattr(
+                    self.rollout_worker,
+                    "configure_rollout_group_timeout",
+                    None,
+                )
+                if configure_rollout_group_timeout is not None:
+                    configure_rollout_group_timeout(self.args.rollout_group_timeout)
             else:
                 # NCCL weight transfer needs full metadata; LoRA mode skips this entirely.
                 weight_names, weight_dtype_names, weight_shapes = [], [], []
@@ -378,6 +385,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     num_completions_to_print=self.args.num_completions_to_print,
                     max_staleness=self.args.max_staleness,
                     samples_per_step=samples_per_step,
+                    rollout_group_timeout=self.args.rollout_group_timeout,
                     weight_names=weight_names,
                     weight_dtype_names=weight_dtype_names,
                     weight_shapes=weight_shapes,
