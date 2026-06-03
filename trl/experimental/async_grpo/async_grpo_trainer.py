@@ -13,33 +13,44 @@
 # limitations under the License.
 
 
+import logging
 import math
 import os
 import queue
+import sys
 import textwrap
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 
-import numpy as np
 import torch
-from accelerate.logging import get_logger
 from datasets import Dataset, IterableDataset
 from torch.distributed._tensor import DTensor
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase, TrainerCallback
-from transformers.data.data_collator import DataCollatorMixin
 
 from trl.trainer.base_trainer import _BaseTrainer
-from trl.trainer.utils import pad, patch_chunked_lm_head
+from trl.trainer.utils import patch_chunked_lm_head
 
 from .async_grpo_config import AdvantageNormalization, AsyncGRPOConfig, LossAggregation, LossFns
 from .async_rollout_worker import AsyncRolloutWorker
+from .rollout_batcher import DataCollatorForRollout, RolloutBatcher, _InfiniteDummyDataset  # noqa: F401
 
 
-logger = get_logger(__name__)
+def _module_logger(name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+logger = _module_logger(__name__)
 
 # A reward function is a callable that returns a list of floats (the rewards). The callable receives prompts,
 # completions, and additional arguments from the trainer (refer to the trainer's source for details). To ensure forward
@@ -91,163 +102,6 @@ class StepIntervalCallback(TrainerCallback):
     def on_step_end(self, _args, state, _control, **_kwargs):
         if state.global_step % self.every_n_steps == 0:
             self.fn()
-
-
-class RolloutQueueDataset(torch.utils.data.IterableDataset):
-    def __init__(
-        self,
-        rollout_queue,
-        model_version_fn,
-        max_staleness=3,
-        timeout=120.0,
-        full_batch_size=None,
-        staleness_guard_fn=None,
-    ):
-        self.queue = rollout_queue
-        self.model_version_fn = model_version_fn
-        self.max_staleness = max_staleness
-        self.timeout = timeout
-        self.full_batch_size = full_batch_size
-        self.staleness_guard_fn = staleness_guard_fn
-
-    def _pull_next_sample(self):
-        """Pull the next trainable sample from the queue, or None on timeout."""
-        if self.staleness_guard_fn is not None:
-            self.staleness_guard_fn()
-
-        t0 = time.time()
-        try:
-            sample = self.queue.get(timeout=self.timeout)
-        except queue.Empty:
-            return None, 0.0, 0
-        wait_s = time.time() - t0
-
-        staleness = self.model_version_fn() - sample.model_version
-        if staleness > self.max_staleness:
-            # raise RuntimeError(
-            logger.error(
-                "Backpressure invariant failed: rollout sample exceeded max_staleness "
-                f"(staleness={staleness}, max={self.max_staleness}, "
-                f"sample_version={sample.model_version}, current_version={self.model_version_fn()})."
-            )
-        return sample, wait_s, staleness
-
-    def _sample_to_dict(self, sample, queue_wait_time_s, batch_adv_std, staleness):
-        return {
-            "input_ids": sample.input_ids,
-            "completion_mask": sample.completion_mask,
-            "old_log_probs": sample.old_log_probs,
-            "advantage": sample.advantage,
-            "prompt_total_tokens": sample.prompt_total_tokens,
-            "prompt_group_id": sample.prompt_group_id,
-            "batch_adv_std": batch_adv_std,
-            "metrics": {**sample.metrics, "queue_wait_time_s": queue_wait_time_s, "staleness": float(staleness)},
-        }
-
-    def __iter__(self):
-        while True:
-            if self.full_batch_size and self.full_batch_size >= 1:
-                buffer = []
-                wait_times = []
-                staleness_vals = []
-                while len(buffer) < self.full_batch_size:
-                    if not buffer and self.queue.qsize() == 0:
-                        logger.info("queue empty, waiting for rollout samples...")
-                    sample, wait_s, staleness = self._pull_next_sample()
-                    if sample is None:
-                        logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
-                        if buffer:
-                            break
-                        return
-                    buffer.append(sample)
-                    wait_times.append(wait_s)
-                    staleness_vals.append(staleness)
-
-                advs = np.array([s.advantage for s in buffer], dtype=np.float64)
-                batch_adv_std = float(advs.std()) + 1e-8
-
-                if len(buffer) < self.full_batch_size:
-                    logger.warning(
-                        "partial batch for adv normalization: %d/%d samples (adv_std=%.6f)",
-                        len(buffer), self.full_batch_size, batch_adv_std,
-                    )
-
-                for sample, wait_s, staleness in zip(buffer, wait_times, staleness_vals):
-                    yield self._sample_to_dict(sample, wait_s, batch_adv_std, staleness)
-            else:
-                if self.queue.qsize() == 0:
-                    logger.info("queue empty, waiting for rollout samples...")
-                sample, wait_s, staleness = self._pull_next_sample()
-                if sample is None:
-                    logger.warning(f"Rollout queue empty for {self.timeout}s, stopping epoch")
-                    return
-                if wait_s > 1.0:
-                    logger.info(f"waited {wait_s:.1f}s for sample (qsize={self.queue.qsize()})")
-                yield self._sample_to_dict(sample, wait_s, 0.0, staleness)
-
-
-class _EmptyIterableDataset(torch.utils.data.IterableDataset):
-    """Placeholder for non-rank-0 processes. Never actually iterated."""
-
-    def __iter__(self):
-        return iter([])
-
-
-@dataclass
-class DataCollatorForRollout(DataCollatorMixin):
-    pad_token_id: int
-    return_tensors: str = "pt"
-
-    def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
-        input_ids = [torch.tensor(example["input_ids"], dtype=torch.long) for example in examples]
-        attention_mask = [torch.ones(len(ids), dtype=torch.long) for ids in input_ids]
-        completion_mask = [torch.tensor(example["completion_mask"], dtype=torch.float32) for example in examples]
-        old_log_probs = [torch.tensor(example["old_log_probs"], dtype=torch.float32) for example in examples]
-        advantages = torch.tensor([example["advantage"] for example in examples], dtype=torch.float32)
-        batch_adv_std = torch.tensor([example["batch_adv_std"] for example in examples], dtype=torch.float32)
-        prompt_total_tokens = torch.tensor(
-            [example["prompt_total_tokens"] for example in examples], dtype=torch.float32
-        )
-        prompt_group_ids = [example["prompt_group_id"] for example in examples]
-
-        input_ids = pad(input_ids, padding_value=self.pad_token_id)
-        attention_mask = pad(attention_mask, padding_value=0)
-        completion_mask = pad(completion_mask, padding_value=0)
-        old_log_probs = pad(old_log_probs, padding_value=0)
-
-        # Total valid completion tokens across all samples in the full batch.
-        # Repeated per sample so that DataLoaderDispatcher (dispatch_batches=True) slices correctly on dim=0
-        global_n_tokens = completion_mask.sum()
-        global_n_tokens_repeated = torch.full((len(examples),), global_n_tokens.item(), dtype=torch.float32)
-
-        global_num_prompts = len(set(prompt_group_ids))
-        global_num_prompts_repeated = torch.full((len(examples),), global_num_prompts, dtype=torch.float32)
-
-        # Convert per-sample metrics dicts to a dict of 1D tensors so that Accelerate's
-        # recursive broadcast (dispatch_batches=True) can handle them — it traverses nested
-        # dicts of tensors but chokes on plain Python floats.
-        metrics_list = [example["metrics"] for example in examples]
-        metrics = (
-            {
-                key: torch.tensor([m.get(key, 0.0) for m in metrics_list], dtype=torch.float32)
-                for key in metrics_list[0]
-            }
-            if metrics_list and metrics_list[0]
-            else {}
-        )
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "completion_mask": completion_mask,
-            "old_log_probs": old_log_probs,
-            "advantages": advantages,
-            "batch_adv_std": batch_adv_std,
-            "prompt_total_tokens": prompt_total_tokens,
-            "global_n_tokens": global_n_tokens_repeated,
-            "global_num_prompts": global_num_prompts_repeated,
-            "metrics": metrics,
-        }
 
 
 class AsyncGRPOTrainer(_BaseTrainer):
@@ -513,7 +367,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     num_generations=self.args.num_generations,
                     max_inflight_tasks=self.args.max_inflight_tasks,
                     queue_maxsize=self.args.queue_maxsize,
-                    vllm_server_url=self.args.vllm_server_base_url,
+                    vllm_server_urls=self.args._resolved_vllm_urls,
                     max_tokens=self.args.max_completion_length,
                     temperature=self.args.temperature,
                     request_timeout=self.args.request_timeout,
@@ -539,50 +393,31 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self.rollout_queue = None
             self.rollout_worker = None
 
+        self.rollout_batcher = RolloutBatcher(
+            rollout_queue=self.rollout_queue,
+            rollout_worker=self.rollout_worker,
+            accelerator=self.accelerator,
+            pad_token_id=self.processing_class.pad_token_id,
+            per_device_train_batch_size=self.args.per_device_train_batch_size,
+            max_staleness=self.args.max_staleness,
+            timeout=self.args.vllm_server_timeout,
+            advantage_normalization=self.advantage_normalization,
+            model_version_fn=lambda: self.model_version,
+        )
+
         # Add callbacks
         self.add_callback(StepIntervalCallback(self._sync_weight, self.args.weight_sync_steps))
 
     def get_train_dataloader(self) -> DataLoader:
-        full_batch_size = (
-            self.args.per_device_train_batch_size
-            * self.args.gradient_accumulation_steps
-            * self.accelerator.num_processes
-        )
-        if self.accelerator.is_main_process:
-            staleness_guard_fn = None
-            if self.rollout_worker is not None and hasattr(self.rollout_worker, "wait_until_next_sample_allowed"):
-                def staleness_guard_fn() -> None:
-                    self.rollout_worker.wait_until_next_sample_allowed(
-                        current_version=self.model_version,
-                        max_staleness=self.args.max_staleness,
-                        timeout=self.args.vllm_server_timeout,
-                    )
-            dataset = RolloutQueueDataset(
-                rollout_queue=self.rollout_queue,
-                model_version_fn=lambda: self.model_version,
-                max_staleness=self.args.max_staleness,
-                timeout=self.args.vllm_server_timeout,
-                full_batch_size=(
-                    full_batch_size
-                    if self.advantage_normalization == AdvantageNormalization.BATCH
-                    else None
-                ),
-                staleness_guard_fn=staleness_guard_fn,
-            )
-        else:
-            dataset = _EmptyIterableDataset()
+        # Rollout samples are consumed directly by RolloutBatcher in get_batch_samples().
+        # This dummy dataloader only satisfies the parent Trainer's epoch iterator setup.
+        return DataLoader(_InfiniteDummyDataset(), batch_size=1)
 
-        return self.accelerator.prepare(
-            DataLoader(
-                dataset,
-                batch_size=self.args.per_device_train_batch_size * self.accelerator.num_processes,
-                collate_fn=DataCollatorForRollout(self.processing_class.pad_token_id),
-                num_workers=0,
-                # NOTE(@aminediro):
-                # dispatch_batches = True for DataLoader whose underlying dataset is an IterableDataset
-                # dataloader prepared by the Accelerator is only iterated through on the main process a
-            )
-        )
+    def get_batch_samples(
+        self, epoch_iterator: Iterator, num_batches: int, device: torch.device
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor | int | None]:
+        del epoch_iterator
+        return self.rollout_batcher.get_batch_samples(num_batches=num_batches, device=device)
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -602,6 +437,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
                 "global_num_prompts",
                 "metrics",
             ]
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        t0 = time.time()
+        logger.info("training_step START (forward + backward)")
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        logger.info(f"training_step END loss={loss.item():.4f} elapsed={time.time() - t0:.2f}s")
+        return loss
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         input_ids = inputs["input_ids"]
@@ -636,6 +478,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         old_log_probs = old_log_probs[:, :local_max_len]
 
         forward_start = time.time()
+        logger.info("Running forward pass through model...")
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,

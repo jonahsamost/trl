@@ -68,8 +68,9 @@ class AsyncGRPOConfig(_BaseConfig):
 
         > Parameters that control the vLLM server
 
-        vllm_server_base_url (`str`, *optional*, defaults to `"http://localhost:8000"`):
-            Base URL of the vLLM server used for generation (e.g., `"http://localhost:8000"`).
+        vllm_server_urls (`list[str]`, *optional*, defaults to `["http://localhost:8000"]`):
+            List of vLLM server URLs. For multi-GPU data parallelism, list one URL per vLLM
+            process (typically one per GPU). Requests are distributed round-robin.
         vllm_server_timeout (`float`, *optional*, defaults to `240.0`):
             Total timeout duration in seconds to wait for the vLLM server to be ready.
         request_timeout (`int`, *optional*, defaults to `600`):
@@ -174,9 +175,12 @@ class AsyncGRPOConfig(_BaseConfig):
     )
 
     # Parameters that control the vLLM server
-    vllm_server_base_url: str = field(
-        default="http://localhost:8000",
-        metadata={"help": "Base URL of the vLLM server used for generation (e.g., 'http://localhost:8000')."},
+    vllm_server_urls: list[str] = field(
+        default_factory=lambda: ["http://localhost:8000"],
+        metadata={
+            "help": "List of vLLM server URLs. For multi-GPU data parallelism, list one URL per vLLM process "
+            "(typically one per GPU). Requests are distributed round-robin across servers."
+        },
     )
     vllm_server_timeout: float = field(
         default=240.0,
@@ -324,6 +328,10 @@ class AsyncGRPOConfig(_BaseConfig):
 
         if self.advantage_normalization not in AdvantageNormalization.values():
             raise ValueError(f"Advantage normalization not supported. Supported options are: {AdvantageNormalization.values()}")
+
+        if not self.vllm_server_urls:
+            raise ValueError("vllm_server_urls must contain at least one URL")
+        self._resolved_vllm_urls: list[str] = [u.rstrip("/") for u in self.vllm_server_urls]
 
         # Accelerator config: required for the async IterableDataset-backed dataloader to work correctly.
         # split_batches=True and dispatch_batches=True ensure that the main process drives the dataloader

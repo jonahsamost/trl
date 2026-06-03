@@ -16,8 +16,11 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import math
+import os
 import queue
+import sys
 import threading
 import time
 from collections import Counter
@@ -30,7 +33,6 @@ import aiohttp
 import numpy as np
 import requests
 import torch
-from accelerate.logging import get_logger
 from datasets import Dataset
 from transformers import AutoTokenizer
 
@@ -49,7 +51,19 @@ if is_vllm_available(min_version="0.17.1"):
     from vllm.utils.network_utils import get_ip, get_open_port
 
 
-logger = get_logger(__name__)
+def _module_logger(name: str) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+logger = _module_logger(__name__)
 
 Messages: TypeAlias = list[dict[str, str]]
 
@@ -213,7 +227,7 @@ class AsyncRolloutWorker:
         num_generations: int = 8,
         max_inflight_tasks: int = 128,
         queue_maxsize: int = 0,
-        vllm_server_url: str = "http://localhost:8000",
+        vllm_server_urls: list[str] | str = "http://localhost:8000",
         max_tokens: int = 32,
         temperature: float = 1.0,
         request_timeout: int = 120,
@@ -234,6 +248,7 @@ class AsyncRolloutWorker:
         no_positive_resample_threshold: float = 0.9,
         no_positive_resample_min_samples: int = 16,
     ):
+        logger.info("initing async rollout worker")
         if not is_vllm_available(min_version="0.17.1"):
             raise ImportError(
                 "vLLM >= 0.17.1 is required to use AsyncRolloutWorker. Install it with: pip install 'vllm>=0.17.1'"
@@ -305,8 +320,12 @@ class AsyncRolloutWorker:
                 self._sync_tool_dicts[i][tool.__name__] = tool
         self.tools = base_tools + (environment_methods[0] if self.environments is not None else [])
 
-        self.vllm_server_url = vllm_server_url.rstrip("/")
-        self.model_update_group = None
+        if isinstance(vllm_server_urls, str):
+            self.vllm_server_urls = [vllm_server_urls.rstrip("/")]
+        else:
+            self.vllm_server_urls = [u.rstrip("/") for u in vllm_server_urls]
+        self.vllm_server_url = self.vllm_server_urls[0]
+        self.model_update_groups: list = []
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.request_timeout = request_timeout
@@ -334,15 +353,15 @@ class AsyncRolloutWorker:
         self.model_version = 0
         self.session = None
 
+        self._lora_nccl_groups: list = []
         self._wait_for_server_ready_sync(timeout_s=self.server_timeout)
         if self.lora_sync:
-            logger.info("LoRA sync mode: initializing direct NCCL LoRA transfer")
-            self.model_update_group = None
-            self._lora_nccl_group = None
-            self._init_lora_sync_group()
+            logger.info("LoRA sync mode: initializing direct NCCL LoRA transfer for %d server(s)", len(self.vllm_server_urls))
+            for url in self.vllm_server_urls:
+                self._init_lora_sync_group_for(url)
         else:
-            self._lora_nccl_group = None
-            self._init_weight_transfer()
+            for url in self.vllm_server_urls:
+                self._init_weight_transfer_for(url)
 
     def _record_group_outcome(self, outcome: str) -> None:
         """Track group-level outcomes that may not produce trainable samples."""
@@ -369,30 +388,35 @@ class AsyncRolloutWorker:
             }
 
     def _wait_for_server_ready_sync(self, timeout_s: float = 240.0, poll_interval_s: float = 2.0) -> None:
-        """Block until the vLLM server is healthy."""
-        logger.info(f"Waiting for vLLM server at {self.vllm_server_url} ...")
+        """Block until all vLLM servers are healthy."""
+        for url in self.vllm_server_urls:
+            self._wait_for_one_server(url, timeout_s, poll_interval_s)
+
+    @staticmethod
+    def _wait_for_one_server(url: str, timeout_s: float = 240.0, poll_interval_s: float = 2.0) -> None:
+        logger.info(f"Waiting for vLLM server at {url} ...")
         start = time.time()
         while True:
             elapsed = time.time() - start
             try:
-                response = requests.get(f"{self.vllm_server_url}/health", timeout=5)
+                response = requests.get(f"{url}/health", timeout=5)
                 if response.status_code == 200:
-                    logger.info(f"vLLM server ready after {elapsed:.1f}s")
+                    logger.info(f"vLLM server at {url} ready after {elapsed:.1f}s")
                     return
             except (requests.ConnectionError, requests.Timeout, OSError):
                 pass
             if elapsed >= timeout_s:
                 raise TimeoutError(
-                    f"Timed out after {timeout_s:.0f}s waiting for vLLM server at {self.vllm_server_url}. "
+                    f"Timed out after {timeout_s:.0f}s waiting for vLLM server at {url}. "
                     "Make sure the vLLM server is running and reachable. If the server needs more time to load "
                     "the model, increase `vllm_server_timeout` in your AsyncGRPOConfig."
                 )
             if int(elapsed) % 10 < poll_interval_s:
-                logger.info(f"Still waiting for vLLM server... ({elapsed:.0f}s)")
+                logger.info(f"Still waiting for vLLM server at {url}... ({elapsed:.0f}s)")
             time.sleep(poll_interval_s)
 
-    def _init_weight_transfer(self) -> None:
-        response = requests.get(f"{self.vllm_server_url}/get_world_size")
+    def _init_weight_transfer_for(self, url: str) -> None:
+        response = requests.get(f"{url}/get_world_size")
         inference_world_size = response.json()["world_size"]
         world_size = inference_world_size + 1
         master_address = get_ip()
@@ -406,11 +430,11 @@ class AsyncRolloutWorker:
         }
         t_init = threading.Thread(
             target=requests.post,
-            args=(f"{self.vllm_server_url}/init_weight_transfer_engine",),
+            args=(f"{url}/init_weight_transfer_engine",),
             kwargs={"json": {"init_info": init_info}, "timeout": 120},
         )
         t_init.start()
-        self.model_update_group = NCCLWeightTransferEngine.trainer_init(
+        group = NCCLWeightTransferEngine.trainer_init(
             {
                 "master_address": master_address,
                 "master_port": master_port,
@@ -418,12 +442,12 @@ class AsyncRolloutWorker:
             }
         )
         t_init.join()
+        self.model_update_groups.append(group)
+        logger.info("Init weight sync group with vLLM at %s", url)
 
-        logger.info("Init weight sync group with vLLM")
-
-    def _init_lora_sync_group(self) -> None:
-        """Initialize a dedicated NCCL group for LoRA-only weight transfer."""
-        response = requests.get(f"{self.vllm_server_url}/get_world_size")
+    def _init_lora_sync_group_for(self, url: str) -> None:
+        """Initialize a dedicated NCCL group for LoRA-only weight transfer to one server."""
+        response = requests.get(f"{url}/get_world_size")
         inference_world_size = response.json()["world_size"]
         world_size = inference_world_size + 1
         master_address = get_ip()
@@ -439,7 +463,7 @@ class AsyncRolloutWorker:
         }
         t_init = threading.Thread(
             target=requests.post,
-            args=(f"{self.vllm_server_url}/init_lora_sync_group",),
+            args=(f"{url}/init_lora_sync_group",),
             kwargs={"json": init_info, "timeout": 120},
         )
         t_init.start()
@@ -451,12 +475,13 @@ class AsyncRolloutWorker:
         pg = _create_stateless_pg(
             host=master_address, port=master_port, rank=0, world_size=world_size
         )
-        self._lora_nccl_group = PyNcclCommunicator(pg, device=torch.device(f"cuda:{torch.cuda.current_device()}"))
+        nccl_group = PyNcclCommunicator(pg, device=torch.device(f"cuda:{torch.cuda.current_device()}"))
         t_init.join()
-        logger.info("LoRA NCCL sync group initialized (world_size=%d)", world_size)
+        self._lora_nccl_groups.append(nccl_group)
+        logger.info("LoRA NCCL sync group initialized for %s (world_size=%d)", url, world_size)
 
     def send_lora_weights(self, lora_param_iter, lora_alpha: float, lora_rank: int, lora_int_id: int) -> None:
-        """Send LoRA A/B tensors to vLLM via NCCL, then trigger set_lora on the server side.
+        """Send LoRA A/B tensors to all vLLM servers via NCCL.
 
         Args:
             lora_param_iter: Iterator of (peft_param_name, tensor) for LoRA params only.
@@ -464,13 +489,12 @@ class AsyncRolloutWorker:
             lora_rank: The LoRA rank from the adapter config.
             lora_int_id: The integer ID of the LoRA adapter in vLLM's slot table.
         """
-        if self._lora_nccl_group is None:
-            logger.warning("LoRA NCCL group not initialized, skipping send_lora_weights")
+        if not self._lora_nccl_groups:
+            logger.warning("LoRA NCCL groups not initialized, skipping send_lora_weights")
             return
 
         t0 = time.time()
 
-        # Collect param metadata and tensors
         params = []
         tensors = []
         for name, tensor in lora_param_iter:
@@ -488,21 +512,24 @@ class AsyncRolloutWorker:
             "params": params,
         })
 
-        # POST /update_lora in a background thread (it pauses, calls collective_rpc, resumes)
-        t_update = threading.Thread(
-            target=requests.post,
-            args=(f"{self.vllm_server_url}/update_lora",),
-            kwargs={"json": {"manifest_json": manifest}, "timeout": 300},
-        )
-        t_update.start()
-
-        # Broadcast tensors to vLLM workers
         import torch as _torch
-        for tensor in tensors:
-            self._lora_nccl_group.broadcast(tensor, src=0, stream=_torch.cuda.current_stream())
+        stream = _torch.cuda.current_stream()
 
-        t_update.join()
-        logger.info("[weight_sync] LoRA NCCL send took %.1fs (%d params)", time.time() - t0, len(tensors))
+        for url, nccl_group in zip(self.vllm_server_urls, self._lora_nccl_groups, strict=True):
+            t_update = threading.Thread(
+                target=requests.post,
+                args=(f"{url}/update_lora",),
+                kwargs={"json": {"manifest_json": manifest}, "timeout": 300},
+            )
+            t_update.start()
+            for tensor in tensors:
+                nccl_group.broadcast(tensor, src=0, stream=stream)
+            t_update.join()
+
+        logger.info(
+            "[weight_sync] LoRA NCCL send to %d server(s) took %.1fs (%d params)",
+            len(self.vllm_server_urls), time.time() - t0, len(tensors),
+        )
 
     def update_model_version(self, model_version: int):
         self.model_version = model_version
@@ -691,56 +718,61 @@ class AsyncRolloutWorker:
             self._destroy_model_update_group()
 
     def _destroy_model_update_group(self) -> None:
-        if self.model_update_group is not None:
-            self.model_update_group.group.store = None
-            self.model_update_group.group.socket = None
-            self.model_update_group = None
-        if self._lora_nccl_group is not None:
-            self._lora_nccl_group = None
+        for group in self.model_update_groups:
+            group.group.store = None
+            group.group.socket = None
+        self.model_update_groups.clear()
+        self._lora_nccl_groups.clear()
 
     def pause(self, clear_cache: bool = False) -> None:
         t0 = time.time()
-        requests.post(f"{self.vllm_server_url}/pause", params={"mode": "keep", "clear_cache": str(clear_cache).lower()})
-        logger.debug(f"[weight_sync] pause HTTP took {time.time() - t0:.1f}s")
+        for url in self.vllm_server_urls:
+            requests.post(f"{url}/pause", params={"mode": "keep", "clear_cache": str(clear_cache).lower()})
+        logger.debug(f"[weight_sync] pause HTTP for {len(self.vllm_server_urls)} server(s) took {time.time() - t0:.1f}s")
 
     def resume(self) -> None:
         t0 = time.time()
-        requests.post(f"{self.vllm_server_url}/resume")
-        logger.debug(f"[weight_sync] resume HTTP took {time.time() - t0:.1f}s")
+        for url in self.vllm_server_urls:
+            requests.post(f"{url}/resume")
+        logger.debug(f"[weight_sync] resume HTTP for {len(self.vllm_server_urls)} server(s) took {time.time() - t0:.1f}s")
 
     def reload_lora(self, adapter_path: str, lora_name: str) -> None:
-        """Tell vLLM to hot-reload a LoRA adapter from disk."""
+        """Tell all vLLM servers to hot-reload a LoRA adapter from disk."""
         t0 = time.time()
         payload = {
             "lora_name": lora_name,
             "lora_path": adapter_path,
             "load_inplace": True,
         }
-        resp = requests.post(f"{self.vllm_server_url}/v1/load_lora_adapter", json=payload, timeout=120)
-        resp.raise_for_status()
-        logger.info(f"[weight_sync] LoRA reload ({lora_name} from {adapter_path}) took {time.time() - t0:.1f}s")
+        for url in self.vllm_server_urls:
+            resp = requests.post(f"{url}/v1/load_lora_adapter", json=payload, timeout=120)
+            resp.raise_for_status()
+        logger.info(f"[weight_sync] LoRA reload ({lora_name}) to {len(self.vllm_server_urls)} server(s) took {time.time() - t0:.1f}s")
 
     def send_weights(self, iterator) -> None:
-        if self.model_update_group is None:
+        if not self.model_update_groups:
             return
         t0 = time.time()
-        t_update = threading.Thread(
-            target=requests.post,
-            args=(f"{self.vllm_server_url}/update_weights",),
-            kwargs={"json": {"update_info": self._weight_update_info}, "timeout": 1800},
-        )
-        t_update.start()
-        logger.debug(f"[weight_sync] /update_weights POST sent ({time.time() - t0:.1f}s)")
-        t_nccl = time.time()
-        NCCLWeightTransferEngine.trainer_send_weights(
-            iterator=iterator,
-            trainer_args=NCCLTrainerSendWeightsArgs(group=self.model_update_group, packed=True),
-        )
-        logger.debug(f"[weight_sync] NCCL transfer took {time.time() - t_nccl:.1f}s")
-        t_join = time.time()
-        t_update.join()
-        logger.debug(
-            f"[weight_sync] /update_weights join took {time.time() - t_join:.1f}s (total send_weights: {time.time() - t0:.1f}s)"
+
+        # Materialize the iterator once so we can replay it for each server
+        weight_list = list(iterator)
+
+        for url, group in zip(self.vllm_server_urls, self.model_update_groups, strict=True):
+            t_update = threading.Thread(
+                target=requests.post,
+                args=(f"{url}/update_weights",),
+                kwargs={"json": {"update_info": self._weight_update_info}, "timeout": 1800},
+            )
+            t_update.start()
+            NCCLWeightTransferEngine.trainer_send_weights(
+                iterator=iter(weight_list),
+                trainer_args=NCCLTrainerSendWeightsArgs(group=group, packed=True),
+            )
+            t_update.join()
+
+        logger.info(
+            "[weight_sync] send_weights to %d server(s) took %.1fs",
+            len(self.vllm_server_urls), time.time() - t0,
         )
 
     async def _generate_loop(self, stop_event: asyncio.Event) -> None:
@@ -749,6 +781,8 @@ class AsyncRolloutWorker:
         inflight_tasks: dict[asyncio.Task, tuple[int, int]] = {}
         free_slots = set(range(self.max_inflight_tasks))
         work_iter = self._repeat_iterator()
+        total_completions_finished = 0
+        _server_rr_counter = 0
 
         self._generation_start_time = time.monotonic()
         try:
@@ -796,9 +830,11 @@ class AsyncRolloutWorker:
                         # Current assumption: reset side effects matter, return value is ignored.
                         self.environments[slot].reset(**row)
 
-                    logger.info(f"[slot] assigned slot={slot} group={group_id} free_after={len(free_slots)}")
+                    server_url = self.vllm_server_urls[_server_rr_counter % len(self.vllm_server_urls)]
+                    _server_rr_counter += 1
+                    logger.info(f"[slot] assigned slot={slot} group={group_id} server={server_url} free_after={len(free_slots)}")
                     task = asyncio.create_task(
-                        self._generate_one(pending_groups[group_id].prompt, tool_dict=self._sync_tool_dicts[slot])
+                        self._generate_one(pending_groups[group_id].prompt, tool_dict=self._sync_tool_dicts[slot], server_url=server_url)
                     )
                     inflight_tasks[task] = (group_id, slot)
 
@@ -842,6 +878,23 @@ class AsyncRolloutWorker:
                     # TODO: move this in generation task, shouldn't matter but is correct
                     self._total_completion_tokens += sum(tool_mask)
                     pending_completed[group_id] += 1
+                    total_completions_finished += 1
+                    group_done = pending_completed[group_id]
+                    wave_done = sum(pending_completed.values())
+                    wave_expected = len(pending_groups) * self.num_generations
+                    logger.info(
+                        "[generate] completion finished: group=%d group_done=%d/%d "
+                        "wave_done=%d/%d total_done=%d inflight=%d free_slots=%d pending_groups=%d",
+                        group_id,
+                        group_done,
+                        self.num_generations,
+                        wave_done,
+                        wave_expected,
+                        total_completions_finished,
+                        len(inflight_tasks),
+                        len(free_slots),
+                        len(pending_groups),
+                    )
 
                     if pending_completed[group_id] == self.num_generations:
                         group.queued_at = time.monotonic()
@@ -853,7 +906,7 @@ class AsyncRolloutWorker:
                                 if stop_event.is_set():
                                     return
                                 await asyncio.sleep(0.1)
-                        logger.debug(f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}")
+                        logger.info(f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}")
                         del pending_groups[group_id]
                         del pending_completed[group_id]
         finally:
@@ -929,6 +982,7 @@ class AsyncRolloutWorker:
                 self._total_groups_scored += 1
 
                 for sample in samples:
+                    logger.info('[enqueue] pushing to rollout buffer')
                     while True:
                         try:
                             self.rollout_buffer.put_nowait(sample)
@@ -942,7 +996,7 @@ class AsyncRolloutWorker:
                             )
                             await asyncio.sleep(0.1)
 
-                logger.debug(
+                logger.info(
                     f"Scored group with {len(samples)} samples; rollout_buffer_qsize={self.rollout_buffer.qsize()}"
                 )
             finally:
@@ -978,8 +1032,9 @@ class AsyncRolloutWorker:
             group_id += 1
 
     async def _generate_one(
-        self, prompt: Messages, tool_dict: dict[str, Callable]
+        self, prompt: Messages, tool_dict: dict[str, Callable], server_url: str | None = None,
     ) -> tuple[list[dict[str, str]], list[int], list[float], list[int], int, int]:
+        url = server_url or self.vllm_server_url
         completion, completion_ids, completion_logprobs, tool_mask = [], [], [], []
         tool_call_count = 0
         tool_failure_count = 0
@@ -994,7 +1049,7 @@ class AsyncRolloutWorker:
             **self.chat_template_kwargs,
         )
         while True:
-            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
+            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids, server_url=url)
             assistant_message = parse_response(self.tokenizer, turn_ids)
             completion.append(assistant_message)
             completion_ids.extend(turn_ids)
@@ -1079,7 +1134,8 @@ class AsyncRolloutWorker:
             tool_messages.append({"role": "tool", "name": name, "content": str(result)})
         return tool_messages, n_calls, n_failures
 
-    async def _generate_one_turn(self, prompt_ids: list[int]) -> tuple[list[int], list[float]]:
+    async def _generate_one_turn(self, prompt_ids: list[int], server_url: str | None = None) -> tuple[list[int], list[float]]:
+        url = server_url or self.vllm_server_url
         payload = {
             "model": self.model_name,
             "prompt": prompt_ids,
@@ -1091,13 +1147,14 @@ class AsyncRolloutWorker:
         }
         while True:
             try:
-                output = await self._post("/v1/completions", payload, self.request_timeout)
+                output = await self._post(url, "/v1/completions", payload, self.request_timeout)
                 break
             except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError, aiohttp.ClientResponseError):
-                # vLLM drops connections or returns 503 during weight sync (/pause). Wait briefly and retry.
-                logger.debug("Server unavailable (likely weight sync pause), retrying...")
+                logger.debug("Server %s unavailable (likely weight sync pause), retrying...", url)
                 await asyncio.sleep(1.0)
         choice = output["choices"][0]
+        if choice.get('finish_reason', '') == 'length':
+            logger.info("Completion length bounded by max_tokens")
         completion_ids = choice["token_ids"]
         completion_logprobs = choice["logprobs"]["token_logprobs"]
         return completion_ids, completion_logprobs
@@ -1208,19 +1265,19 @@ class AsyncRolloutWorker:
             )
         ]
 
-    async def _post(self, path: str, payload: dict, timeout: float, max_retries: int = 3) -> dict:
+    async def _post(self, base_url: str, path: str, payload: dict, timeout: float, max_retries: int = 3) -> dict:
         client_timeout = aiohttp.ClientTimeout(total=timeout)
         for attempt in range(max_retries):
             try:
                 async with self.session.post(
-                    f"{self.vllm_server_url}{path}", json=payload, timeout=client_timeout
+                    f"{base_url}{path}", json=payload, timeout=client_timeout
                 ) as response:
                     response.raise_for_status()
                     content = await response.json()
                     return content if content else {}
             except (TimeoutError, asyncio.TimeoutError):
                 if attempt < max_retries - 1:
-                    logger.warning(f"POST {path} timed out (attempt {attempt + 1}/{max_retries}), retrying...")
+                    logger.warning(f"POST {base_url}{path} timed out (attempt {attempt + 1}/{max_retries}), retrying...")
                     await asyncio.sleep(1)
                 else:
                     raise
