@@ -253,6 +253,20 @@ class AsyncGRPOConfig(_BaseConfig):
             "0.0 disables ECHO (pure GRPO). Recommended: 0.05 for base models, 0.02 for SFT-initialized."
         },
     )
+    kl_coeff: float = field(
+        default=0.0,
+        metadata={
+            "help": "KL divergence penalty coefficient. Penalizes policy drift from the reference "
+            "(old) policy using the Joschu KL approximation. 0.0 disables the penalty."
+        },
+    )
+    entropy_coeff: float = field(
+        default=0.0,
+        metadata={
+            "help": "Entropy bonus coefficient. Subtracted from the loss to encourage exploration "
+            "and prevent entropy collapse. 0.0 disables the bonus."
+        },
+    )
 
     # Parameters that control the async rollout pipeline
     max_inflight_tasks: int = field(

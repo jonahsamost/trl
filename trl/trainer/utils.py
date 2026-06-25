@@ -1270,9 +1270,10 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
 
         log_z = max_old + torch.log(sum_exp)
         logprobs = target_logit - log_z
-        entropy = log_z - x_sum_exp / sum_exp
+        mean_logits = x_sum_exp / sum_exp
+        entropy = log_z - mean_logits
 
-        ctx.save_for_backward(last_hidden, weight, targets, log_z)
+        ctx.save_for_backward(last_hidden, weight, targets, log_z, mean_logits)
         ctx.temperature = temperature
         ctx.chunk_size = chunk_size
         ctx.logit_scale = logit_scale
@@ -1282,7 +1283,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_logprobs: torch.Tensor, grad_entropy: torch.Tensor):  # type: ignore
-        hidden, weight, labels, log_z = ctx.saved_tensors
+        hidden, weight, labels, log_z, mean_logits = ctx.saved_tensors
         temperature: float = ctx.temperature
         chunk_size: int = ctx.chunk_size
         logit_scale: float = ctx.logit_scale
@@ -1304,6 +1305,7 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
         logits_buf = torch.empty((N, chunk_size), device=hidden.device, dtype=torch.float32)
 
         g = grad_logprobs.to(torch.float32)  # [N]
+        g_entropy = grad_entropy.to(torch.float32)  # [N]
         row_idx = torch.arange(N, device=hidden.device)
 
         for start in range(0, vocab, chunk_size):
@@ -1324,6 +1326,8 @@ class _ChunkedLogProbFunction(torch.autograd.Function):
             local_idx = torch.clamp(labels - start, 0, end - start - 1)
             # If label in chunk add g to grad else it stays the same
             grad_logits[row_idx, local_idx] += g * in_chunk_cond
+            # dH/d(logits_j) = p_j * (E_p[logits] - logits_j)
+            grad_logits += g_entropy.unsqueeze(-1) * probs * (mean_logits.unsqueeze(-1) - logits_chunk)
             grad_logits = grad_logits * inv_t
 
             grad_hidden.add_(grad_logits @ w_chunk.float())

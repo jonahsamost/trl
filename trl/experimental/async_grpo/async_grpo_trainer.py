@@ -104,6 +104,30 @@ class StepIntervalCallback(TrainerCallback):
             self.fn()
 
 
+class _SaveCheckpointCallback(TrainerCallback):
+    """Explicitly save the model every N optimizer steps.
+
+    Works around the HF Trainer's built-in save logic not firing when using
+    the async rollout batcher / _InfiniteDummyDataset approach.
+    """
+
+    def __init__(self, trainer: "AsyncGRPOTrainer", every_n_steps: int):
+        self._trainer = trainer
+        self._every_n_steps = every_n_steps
+
+    def on_step_end(self, _args, state, _control, **_kwargs):
+        if self._every_n_steps <= 0:
+            return
+        if state.global_step > 0 and state.global_step % self._every_n_steps == 0:
+            output_dir = os.path.join(
+                self._trainer.args.output_dir,
+                f"checkpoint-{state.global_step}",
+            )
+            logger.info("Saving checkpoint at step %d to %s", state.global_step, output_dir)
+            self._trainer.save_model(output_dir)
+            logger.info("Checkpoint saved: %s", output_dir)
+
+
 class AsyncGRPOTrainer(_BaseTrainer):
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
@@ -230,6 +254,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self.loss_aggregation = LossAggregation(self.args.loss_aggregation)
         self.advantage_normalization = AdvantageNormalization(self.args.advantage_normalization)
         self.echo_lambda = self.args.echo_lambda
+        self.kl_coeff = self.args.kl_coeff
+        self.entropy_coeff = self.args.entropy_coeff
 
         # Model
         model_name = model
@@ -415,6 +441,8 @@ class AsyncGRPOTrainer(_BaseTrainer):
 
         # Add callbacks
         self.add_callback(StepIntervalCallback(self._sync_weight, self.args.weight_sync_steps))
+        if self.args.save_steps and self.args.save_steps > 0:
+            self.add_callback(_SaveCheckpointCallback(self, self.args.save_steps))
 
     def get_train_dataloader(self) -> DataLoader:
         # Rollout samples are consumed directly by RolloutBatcher in get_batch_samples().
@@ -574,6 +602,18 @@ class AsyncGRPOTrainer(_BaseTrainer):
             echo_loss = per_seq_env_loss.mean()
             loss = loss + self.echo_lambda * echo_loss / self.current_gradient_accumulation_steps
 
+        # Joschu KL approximation (always >= 0). Computed in the grad-tracked block
+        # so the KL penalty produces gradients, and reused (detached) for logging below.
+        kl_per_token = (ratio - 1) - log_ratio
+
+        if self.kl_coeff > 0:
+            kl_loss = (kl_per_token * completion_mask).sum() / completion_mask.sum().clamp(min=1)
+            loss = loss + self.kl_coeff * kl_loss / self.current_gradient_accumulation_steps
+
+        if self.entropy_coeff > 0:
+            valid_entropy = (entropy * completion_mask).sum() / completion_mask.sum().clamp(min=1)
+            loss = loss - self.entropy_coeff * valid_entropy / self.current_gradient_accumulation_steps
+
         with torch.no_grad():
             valid_mask = completion_mask > 0
             local_count = valid_mask.sum().float()
@@ -581,9 +621,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
             local_ratio_sum = (
                 ratio[valid_mask].sum() if valid_mask.any() else torch.zeros((), device=completion_mask.device)
             )
-            # Approx KL: http://joschu.net/blog/kl-approx.html
+            # Reuse the grad-block kl_per_token for logging (detached via no_grad context)
             local_kl_sum = (
-                ((ratio[valid_mask] - 1) - log_ratio[valid_mask]).sum()
+                kl_per_token[valid_mask].sum()
                 if valid_mask.any()
                 else torch.zeros((), device=completion_mask.device)
             )
