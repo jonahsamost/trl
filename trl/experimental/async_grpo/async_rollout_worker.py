@@ -37,6 +37,14 @@ from trl.chat_template_utils import (
 from trl.import_utils import is_vllm_available
 from trl.trainer.utils import print_prompt_completions_sample
 
+from forking.entropy_v2.entropy_updates import EntropyUpdateTracker
+from forking.entropy_v2.models import (
+    ENTROPY_RESPONSE_KEY,
+    ENTROPY_XARGS_INTERVENE_KEY,
+    REQUESTED_INTERVENE_KEY,
+    VLLM_XARGS_KEY,
+)
+
 
 if is_vllm_available(min_version="0.17.1"):
     from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
@@ -58,6 +66,7 @@ class RolloutGroup:
     completions: list[Messages]
     completions_ids: list[list[int]]
     completions_logprobs: list[list[float]]
+    entropy_metadata: list[dict[str, Any]]
     tool_mask: list[list[int]]
     tool_call_counts: list[int]
     tool_failure_counts: list[int]
@@ -96,6 +105,7 @@ class AsyncRolloutWorker:
         max_inflight_tasks: int = 128,
         queue_maxsize: int = 0,
         vllm_server_url: str = "http://localhost:8000",
+        completions_endpoint: str = "/v1/completions",
         max_tokens: int = 32,
         temperature: float = 1.0,
         request_timeout: int = 120,
@@ -107,6 +117,7 @@ class AsyncRolloutWorker:
         weight_names: list[str] | None = None,
         weight_dtype_names: list[str] | None = None,
         weight_shapes: list[list[int]] | None = None,
+        entropy_tracker: EntropyUpdateTracker | None = None,
     ):
         if not is_vllm_available(min_version="0.17.1"):
             raise ImportError(
@@ -157,6 +168,9 @@ class AsyncRolloutWorker:
         self.tools = base_tools + (environment_methods[0] if self.environments is not None else [])
 
         self.vllm_server_url = vllm_server_url.rstrip("/")
+        self.completions_endpoint = (
+            completions_endpoint if completions_endpoint.startswith("/") else f"/{completions_endpoint}"
+        )
         self.model_update_group = None
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -180,6 +194,7 @@ class AsyncRolloutWorker:
         self._generation_start_time: float | None = None
         self.model_version = 0
         self.session = None
+        self.entropy_tracker = entropy_tracker
 
         # Wait for the vLLM server and initialize NCCL weight transfer.
         self._wait_for_server_ready_sync(timeout_s=self.server_timeout)
@@ -322,6 +337,7 @@ class AsyncRolloutWorker:
     async def _generate_loop(self, stop_event: asyncio.Event) -> None:
         pending_groups: dict[int, RolloutGroup] = {}
         pending_completed: dict[int, int] = {}
+        pending_started: dict[int, int] = {}
         inflight_tasks: dict[asyncio.Task, tuple[int, int]] = {}
         free_slots = set(range(self.max_inflight_tasks))
         work_iter = self._repeat_iterator()
@@ -353,12 +369,14 @@ class AsyncRolloutWorker:
                             completions=[],
                             completions_ids=[],
                             completions_logprobs=[],
+                            entropy_metadata=[],
                             tool_mask=[],
                             tool_call_counts=[],
                             tool_failure_counts=[],
                             model_version=self.model_version,
                         )
                         pending_completed[group_id] = 0
+                        pending_started[group_id] = 0
                         logger.debug(f"Started group {group_id}; pending_groups={len(pending_groups)}")
 
                     slot = free_slots.pop()
@@ -367,8 +385,14 @@ class AsyncRolloutWorker:
                         self.environments[slot].reset(**row)
 
                     logger.info(f"[slot] assigned slot={slot} group={group_id} free_after={len(free_slots)}")
+                    sample_idx = pending_started[group_id]
+                    pending_started[group_id] += 1
                     task = asyncio.create_task(
-                        self._generate_one(pending_groups[group_id].prompt, tool_dict=self._sync_tool_dicts[slot])
+                        self._generate_one(
+                            pending_groups[group_id].prompt,
+                            tool_dict=self._sync_tool_dicts[slot],
+                            sample_idx=sample_idx,
+                        )
                     )
                     inflight_tasks[task] = (group_id, slot)
 
@@ -398,6 +422,7 @@ class AsyncRolloutWorker:
                         completion,
                         completion_ids,
                         completion_logprobs,
+                        entropy_metadata,
                         tool_mask,
                         tool_call_count,
                         tool_failure_count,
@@ -406,6 +431,7 @@ class AsyncRolloutWorker:
                     group.completions.append(completion)
                     group.completions_ids.append(completion_ids)
                     group.completions_logprobs.append(completion_logprobs)
+                    group.entropy_metadata.append(entropy_metadata)
                     group.tool_mask.append(tool_mask)
                     group.tool_call_counts.append(tool_call_count)
                     group.tool_failure_counts.append(tool_failure_count)
@@ -426,6 +452,7 @@ class AsyncRolloutWorker:
                         logger.debug(f"Group {group_id} complete; queued_for_scoring={self._groups_to_score.qsize()}")
                         del pending_groups[group_id]
                         del pending_completed[group_id]
+                        del pending_started[group_id]
         finally:
             for task in inflight_tasks:
                 task.cancel()
@@ -526,9 +553,12 @@ class AsyncRolloutWorker:
             group_id += 1
 
     async def _generate_one(
-        self, prompt: Messages, tool_dict: dict[str, Callable]
-    ) -> tuple[list[dict[str, str]], list[int], list[float], list[int], int, int]:
+        self, prompt: Messages, tool_dict: dict[str, Callable], sample_idx: int
+    ) -> tuple[list[dict[str, str]], list[int], list[float], dict[str, Any], list[int], int, int]:
         completion, completion_ids, completion_logprobs, tool_mask = [], [], [], []
+        entropy_metadata: dict[str, Any] = (
+            self.entropy_tracker.initial_metadata() if self.entropy_tracker is not None else {}
+        )
         tool_call_count = 0
         tool_failure_count = 0
         iteration_num = 0
@@ -542,15 +572,44 @@ class AsyncRolloutWorker:
             **self.chat_template_kwargs,
         )
         while True:
-            turn_ids, turn_logprobs = await self._generate_one_turn(prompt_ids)
+            vllm_xargs = (
+                self.entropy_tracker.request_xargs(sample_idx)
+                if self.entropy_tracker is not None
+                else None
+            )
+            turn_ids, turn_logprobs, turn_entropy = await self._generate_one_turn(prompt_ids, vllm_xargs)
             assistant_message = parse_response(self.tokenizer, turn_ids)
             completion.append(assistant_message)
+            token_offset = len(completion_ids)
             completion_ids.extend(turn_ids)
             completion_logprobs.extend(turn_logprobs)
+            if self.entropy_tracker is not None:
+                requested_intervene = bool((vllm_xargs or {}).get(ENTROPY_XARGS_INTERVENE_KEY))
+                self.entropy_tracker.merge_entropy_metadata(
+                    entropy_metadata,
+                    turn_entropy,
+                    token_offset,
+                    requested_intervene,
+                )
+                self.entropy_tracker.log_generation_metadata(
+                    sample_idx=sample_idx,
+                    turn_entropy=turn_entropy,
+                    requested_intervene=requested_intervene,
+                    token_offset=token_offset,
+                    turn_len=len(turn_ids),
+                )
             tool_mask.extend([1] * len(turn_ids))
             tool_calls = assistant_message.get("tool_calls")
             if tool_calls is None or (max_iterations is not None and iteration_num >= max_iterations):
-                return completion, completion_ids, completion_logprobs, tool_mask, tool_call_count, tool_failure_count
+                return (
+                    completion,
+                    completion_ids,
+                    completion_logprobs,
+                    entropy_metadata,
+                    tool_mask,
+                    tool_call_count,
+                    tool_failure_count,
+                )
 
             tool_messages, n_calls, n_failures = self._execute_tool_calls(tool_calls, tool_dict)
             tool_call_count += n_calls
@@ -627,7 +686,9 @@ class AsyncRolloutWorker:
             tool_messages.append({"role": "tool", "name": name, "content": str(result)})
         return tool_messages, n_calls, n_failures
 
-    async def _generate_one_turn(self, prompt_ids: list[int]) -> tuple[list[int], list[float]]:
+    async def _generate_one_turn(
+        self, prompt_ids: list[int], vllm_xargs: dict[str, Any] | None
+    ) -> tuple[list[int], list[float], dict[str, Any]]:
         payload = {
             "model": self.model_name,
             "prompt": prompt_ids,
@@ -637,9 +698,11 @@ class AsyncRolloutWorker:
             "return_token_ids": True,
             "logprobs": 0,
         }
+        if vllm_xargs is not None:
+            payload[VLLM_XARGS_KEY] = vllm_xargs
         while True:
             try:
-                output = await self._post("/v1/completions", payload, self.request_timeout)
+                output = await self._post(self.completions_endpoint, payload, self.request_timeout)
                 break
             except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError, aiohttp.ClientResponseError):
                 # vLLM drops connections or returns 503 during weight sync (/pause). Wait briefly and retry.
@@ -648,7 +711,10 @@ class AsyncRolloutWorker:
         choice = output["choices"][0]
         completion_ids = choice["token_ids"]
         completion_logprobs = choice["logprobs"]["token_logprobs"]
-        return completion_ids, completion_logprobs
+        entropy_metadata = output.get(ENTROPY_RESPONSE_KEY, {})
+        if vllm_xargs is not None:
+            entropy_metadata[REQUESTED_INTERVENE_KEY] = bool(vllm_xargs.get(ENTROPY_XARGS_INTERVENE_KEY, 0))
+        return completion_ids, completion_logprobs, entropy_metadata
 
     async def _score_group(self, group: RolloutGroup) -> list[RolloutSample]:
         kwargs = dict(
@@ -675,7 +741,18 @@ class AsyncRolloutWorker:
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         reward_mean = float(rewards.mean())
         reward_std = float(rewards.std())
-        logger.info(f"Rollout metrics: reward_mean={reward_mean:.4f}, reward_std={reward_std:.4f}")
+        zero_solve = float(rewards.max() == 0)
+        failed_completions = [float(r == 0) for r in rewards]
+        logger.info(f"Rollout metrics: reward_mean={reward_mean:.4f}, reward_std={reward_std:.4f}, zero_solve={zero_solve:.0f}, failed={sum(failed_completions):.0f}/{len(rewards)}")
+        entropy_metrics = (
+            self.entropy_tracker.update_from_scored_group(
+                rewards=[float(r) for r in rewards],
+                completion_lengths=[len(ids) for ids in group.completions_ids],
+                entropy_metadata=group.entropy_metadata,
+            )
+            if self.entropy_tracker is not None
+            else {}
+        )
 
         # tools/call_frequency: mean calls per completion (matches TRL's total_calls / num_completions)
         # tools/failure_frequency: per-completion failure rate; averaged across samples in compute_loss
@@ -707,10 +784,13 @@ class AsyncRolloutWorker:
                 metrics={
                     "reward": float(reward),
                     "reward_std": reward_std,
+                    "zero_solve_group": zero_solve,
+                    "failed_completion": failed_completions[i],
                     **{
                         f"rewards/{name}": float(func_reward)
                         for name, func_reward in zip(self.reward_func_names, per_func_rewards[:, i], strict=True)
                     },
+                    **entropy_metrics,
                     **tm,
                 },
             )

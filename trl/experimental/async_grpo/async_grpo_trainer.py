@@ -33,6 +33,8 @@ from transformers.data.data_collator import DataCollatorMixin
 from trl.trainer.base_trainer import _BaseTrainer
 from trl.trainer.utils import pad, patch_chunked_lm_head
 
+from forking.entropy_v2.entropy_updates import EntropyUpdateTracker
+
 from .async_grpo_config import AsyncGRPOConfig
 from .async_rollout_worker import AsyncRolloutWorker
 
@@ -279,6 +281,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
         tools: list[Callable] | None = None,
         environment_factory: EnvironmentFactory | None = None,
         rollout_worker: RolloutWorkerProtocol | None = None,
+        entropy_tracker: EntropyUpdateTracker | None = None,
     ):
         self.args = args or AsyncGRPOConfig()
 
@@ -373,6 +376,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     max_inflight_tasks=self.args.max_inflight_tasks,
                     queue_maxsize=self.args.queue_maxsize,
                     vllm_server_url=self.args.vllm_server_base_url,
+                    completions_endpoint=self.args.vllm_completions_endpoint,
                     max_tokens=self.args.max_completion_length,
                     temperature=self.args.temperature,
                     request_timeout=self.args.request_timeout,
@@ -384,6 +388,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     weight_names=weight_names,
                     weight_dtype_names=weight_dtype_names,
                     weight_shapes=weight_shapes,
+                    entropy_tracker=entropy_tracker,
                 )
             self.rollout_queue = self.rollout_worker.rollout_buffer
         else:

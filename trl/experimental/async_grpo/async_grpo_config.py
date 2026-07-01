@@ -47,6 +47,8 @@ class AsyncGRPOConfig(_BaseConfig):
 
         vllm_server_base_url (`str`, *optional*, defaults to `"http://localhost:8000"`):
             Base URL of the vLLM server used for generation (e.g., `"http://localhost:8000"`).
+        vllm_completions_endpoint (`str`, *optional*, defaults to `"/v1/completions"`):
+            HTTP endpoint path used for completion generation.
         vllm_server_timeout (`float`, *optional*, defaults to `240.0`):
             Total timeout duration in seconds to wait for the vLLM server to be ready.
         request_timeout (`int`, *optional*, defaults to `600`):
@@ -136,6 +138,10 @@ class AsyncGRPOConfig(_BaseConfig):
         default="http://localhost:8000",
         metadata={"help": "Base URL of the vLLM server used for generation (e.g., 'http://localhost:8000')."},
     )
+    vllm_completions_endpoint: str = field(
+        default="/v1/completions",
+        metadata={"help": "HTTP endpoint path used for completion generation."},
+    )
     vllm_server_timeout: float = field(
         default=240.0,
         metadata={
@@ -184,7 +190,6 @@ class AsyncGRPOConfig(_BaseConfig):
         default=1,
         metadata={"help": "Number of training steps between weight synchronizations to the vLLM server."},
     )
-
     # Parameters that control the logging
     log_completions: bool = field(
         default=False,
