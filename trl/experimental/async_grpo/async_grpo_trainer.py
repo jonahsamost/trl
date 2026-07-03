@@ -389,6 +389,7 @@ class AsyncGRPOTrainer(_BaseTrainer):
                     weight_dtype_names=weight_dtype_names,
                     weight_shapes=weight_shapes,
                     entropy_tracker=entropy_tracker,
+                    mask_injected_tokens=self.args.mask_injected_tokens,
                 )
             self.rollout_queue = self.rollout_worker.rollout_buffer
         else:

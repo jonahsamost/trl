@@ -118,6 +118,7 @@ class AsyncRolloutWorker:
         weight_dtype_names: list[str] | None = None,
         weight_shapes: list[list[int]] | None = None,
         entropy_tracker: EntropyUpdateTracker | None = None,
+        mask_injected_tokens: bool = False,
     ):
         if not is_vllm_available(min_version="0.17.1"):
             raise ImportError(
@@ -195,6 +196,7 @@ class AsyncRolloutWorker:
         self.model_version = 0
         self.session = None
         self.entropy_tracker = entropy_tracker
+        self.mask_injected_tokens = mask_injected_tokens
 
         # Wait for the vLLM server and initialize NCCL weight transfer.
         self._wait_for_server_ready_sync(timeout_s=self.server_timeout)
@@ -599,6 +601,12 @@ class AsyncRolloutWorker:
                     turn_len=len(turn_ids),
                 )
             tool_mask.extend([1] * len(turn_ids))
+
+            if self.mask_injected_tokens:
+                for start, end in turn_entropy.get("injection_ranges", []):
+                    for i in range(start, min(end, len(turn_ids))):
+                        tool_mask[token_offset + i] = 0
+
             tool_calls = assistant_message.get("tool_calls")
             if tool_calls is None or (max_iterations is not None and iteration_num >= max_iterations):
                 return (

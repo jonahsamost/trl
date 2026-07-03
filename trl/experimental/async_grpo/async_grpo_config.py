@@ -203,6 +203,16 @@ class AsyncGRPOConfig(_BaseConfig):
         metadata={"help": "Number of completions to print when `log_completions=True`."},
     )
 
+    # Parameters that control entropy-based hint injection (V3)
+    mask_injected_tokens: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, injected hint tokens are masked from the loss (like tool responses). "
+            "If False (default), injected tokens participate in training — the model can learn to "
+            "produce self-correction tokens on its own."
+        },
+    )
+
     def __post_init__(self):
         super().__post_init__()
 
