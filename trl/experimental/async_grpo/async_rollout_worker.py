@@ -37,13 +37,7 @@ from trl.chat_template_utils import (
 from trl.import_utils import is_vllm_available
 from trl.trainer.utils import print_prompt_completions_sample
 
-from forking.entropy_v2.entropy_updates import EntropyUpdateTracker
-from forking.entropy_v2.models import (
-    ENTROPY_RESPONSE_KEY,
-    ENTROPY_XARGS_INTERVENE_KEY,
-    REQUESTED_INTERVENE_KEY,
-    VLLM_XARGS_KEY,
-)
+from forking.entropy_v5.entropy_updates import EntropyUpdateTracker
 
 
 if is_vllm_available(min_version="0.17.1"):
@@ -574,29 +568,23 @@ class AsyncRolloutWorker:
             **self.chat_template_kwargs,
         )
         while True:
-            vllm_xargs = (
-                self.entropy_tracker.request_xargs(sample_idx)
-                if self.entropy_tracker is not None
-                else None
-            )
-            turn_ids, turn_logprobs, turn_entropy = await self._generate_one_turn(prompt_ids, vllm_xargs)
+            turn_ids, turn_logprobs, turn_entropy = await self._generate_one_turn(prompt_ids)
             assistant_message = parse_response(self.tokenizer, turn_ids)
             completion.append(assistant_message)
             token_offset = len(completion_ids)
             completion_ids.extend(turn_ids)
             completion_logprobs.extend(turn_logprobs)
             if self.entropy_tracker is not None:
-                requested_intervene = bool((vllm_xargs or {}).get(ENTROPY_XARGS_INTERVENE_KEY))
                 self.entropy_tracker.merge_entropy_metadata(
                     entropy_metadata,
                     turn_entropy,
                     token_offset,
-                    requested_intervene,
+                    requested_intervene=False,
                 )
                 self.entropy_tracker.log_generation_metadata(
                     sample_idx=sample_idx,
                     turn_entropy=turn_entropy,
-                    requested_intervene=requested_intervene,
+                    requested_intervene=False,
                     token_offset=token_offset,
                     turn_len=len(turn_ids),
                 )
@@ -695,7 +683,7 @@ class AsyncRolloutWorker:
         return tool_messages, n_calls, n_failures
 
     async def _generate_one_turn(
-        self, prompt_ids: list[int], vllm_xargs: dict[str, Any] | None
+        self, prompt_ids: list[int],
     ) -> tuple[list[int], list[float], dict[str, Any]]:
         payload = {
             "model": self.model_name,
@@ -706,22 +694,23 @@ class AsyncRolloutWorker:
             "return_token_ids": True,
             "logprobs": 0,
         }
-        if vllm_xargs is not None:
-            payload[VLLM_XARGS_KEY] = vllm_xargs
+        if self.entropy_tracker is not None:
+            self.entropy_tracker.enrich_payload(payload)
         while True:
             try:
                 output = await self._post(self.completions_endpoint, payload, self.request_timeout)
                 break
             except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionError, aiohttp.ClientResponseError):
-                # vLLM drops connections or returns 503 during weight sync (/pause). Wait briefly and retry.
                 logger.debug("Server unavailable (likely weight sync pause), retrying...")
                 await asyncio.sleep(1.0)
         choice = output["choices"][0]
         completion_ids = choice["token_ids"]
         completion_logprobs = choice["logprobs"]["token_logprobs"]
-        entropy_metadata = output.get(ENTROPY_RESPONSE_KEY, {})
-        if vllm_xargs is not None:
-            entropy_metadata[REQUESTED_INTERVENE_KEY] = bool(vllm_xargs.get(ENTROPY_XARGS_INTERVENE_KEY, 0))
+        entropy_metadata = (
+            self.entropy_tracker.extract_entropy_from_response(output)
+            if self.entropy_tracker is not None
+            else {}
+        )
         return completion_ids, completion_logprobs, entropy_metadata
 
     async def _score_group(self, group: RolloutGroup) -> list[RolloutSample]:
@@ -747,6 +736,12 @@ class AsyncRolloutWorker:
         all_rewards = [[r if r is not None else float("nan") for r in row] for row in all_rewards]
         rewards = np.nansum(np.array(all_rewards, dtype=float), axis=0)
         advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+        if self.entropy_tracker is not None and hasattr(self.entropy_tracker, "compute_advantage_weights"):
+            entropy_weights = self.entropy_tracker.compute_advantage_weights(
+                rewards=[float(r) for r in rewards],
+                entropy_metadata=group.entropy_metadata,
+            )
+            advantages = advantages * np.array(entropy_weights)
         reward_mean = float(rewards.mean())
         reward_std = float(rewards.std())
         zero_solve = float(rewards.max() == 0)
